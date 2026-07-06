@@ -270,27 +270,35 @@ class TestRpcHandler(unittest.TestCase):
     def test_update_firmware(self):
         """update_firmware should download the firmware and run the upgrade script."""
         # We can mock the urllib request to return successfully
-        import urllib.request
+        import hashlib
         from unittest.mock import patch
 
+        firmware_bytes = b"Mock zip/tar content"
         mock_response = MagicMock()
-        mock_response.read.return_value = b"Mock zip/tar content"
+        mock_response.__enter__.return_value.read.return_value = firmware_bytes
         
         with patch('urllib.request.urlopen', return_value=mock_response) as mock_urlopen, \
              patch('subprocess.Popen') as mock_popen:
              
             result = self.handler._cmd_update_firmware({
                 "version": "1.2.0",
-                "url": "http://novena-hub/firmware/1.2.0.tar.gz",
-                "token": "test_token"
+                "url": "https://novena-hub/firmware/1.2.0.tar.gz",
+                "token": "test_token",
+                "sha256": hashlib.sha256(firmware_bytes).hexdigest(),
             })
             
-            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["status"], "accepted")
             self.assertEqual(result["version"], "1.2.0")
             mock_urlopen.assert_called_once()
             mock_popen.assert_called_once()
 
+    def test_update_firmware_rejects_missing_checksum(self):
+        with self.assertRaises(ValueError):
+            self.handler._cmd_update_firmware({
+                "version": "1.2.0",
+                "url": "https://novena-hub/firmware/1.2.0.tar.gz",
+            })
+
 
 if __name__ == "__main__":
     unittest.main()
-

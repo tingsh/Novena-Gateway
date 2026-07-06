@@ -38,6 +38,7 @@ class NovenaMqttPublisher:
         self._qos = config.get("qos", 1)
         self._client_id = config.get("client_id", "novena-gateway")
         self._tls = config.get("tls", None)
+        self._bootstrap = config.get("bootstrap") or config.get("bootstrap_mqtt") or {}
         self._max_queue_size = config.get("max_queue_size", 10000)
         self._reconnect_delay_min = config.get("reconnect_delay_min", 1)
         self._reconnect_delay_max = config.get("reconnect_delay_max", 60)
@@ -47,6 +48,7 @@ class NovenaMqttPublisher:
         # Provisioning-mode tracking
         self._consecutive_failures = 0
         self._activation_message_shown = False
+        self._bootstrap_mode = False
 
         # Default port: 8883 when TLS is configured, 1883 otherwise
         self._port = config.get("port", 8883 if self._tls else 1883)
@@ -69,6 +71,8 @@ class NovenaMqttPublisher:
         self._storage = SQLiteEventStorage(storage_config, log, self._storage_stop_event)
         self._replay_thread = None
         self._replay_lock = threading.Lock()
+        self._last_replay_status = "idle"
+        self._replay_failure_count = 0
 
         # Create MQTT client (paho-mqtt v2.x API)
         self._client = mqtt.Client(
@@ -177,6 +181,8 @@ class NovenaMqttPublisher:
         if self._serial_number:
             provision_topic = f"v1/gateway/{self._serial_number}/provision"
             self.subscribe(provision_topic, self._on_provision_message)
+            bootstrap_topic = f"v1/gateway/{self._serial_number}/bootstrap/activate"
+            self.subscribe(bootstrap_topic, self._on_provision_message)
 
         try:
             self._client.connect(self._host, self._port, keepalive=60)
@@ -282,6 +288,8 @@ class NovenaMqttPublisher:
             self._activation_message_shown = False
             # Re-subscribe to all registered topics on (re)connect
             self._resubscribe_all()
+            if self._bootstrap_mode:
+                self._publish_bootstrap_hello()
             # Trigger throttled replay of offline buffer
             self._trigger_replay()
         else:
@@ -289,6 +297,7 @@ class NovenaMqttPublisher:
             self._connected = False
             self._consecutive_failures += 1
             self._show_activation_message_if_needed()
+            self._switch_to_bootstrap_if_needed()
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
         self._connected = False
@@ -296,6 +305,7 @@ class NovenaMqttPublisher:
             log.warning("Unexpected MQTT disconnect (rc=%s). Will auto-reconnect.", rc)
             self._consecutive_failures += 1
             self._show_activation_message_if_needed()
+            self._switch_to_bootstrap_if_needed()
         else:
             log.info("MQTT disconnected cleanly.")
 
@@ -320,6 +330,34 @@ class NovenaMqttPublisher:
             log.warning(msg)
             # Also print to stdout for users with a monitor connected
             print(msg)
+
+    def _switch_to_bootstrap_if_needed(self):
+        """Fall back to bootstrap credentials after repeated auth/connect failures."""
+        if self._bootstrap_mode or self._consecutive_failures < 3:
+            return
+        if not self._bootstrap.get("enabled", False):
+            return
+        username = self._bootstrap.get("username")
+        password = self._bootstrap.get("password")
+        if not username or not password:
+            log.warning("Bootstrap fallback is enabled but username/password are missing.")
+            return
+
+        self._bootstrap_mode = True
+        self._username = username
+        self._password = password
+        self._client.username_pw_set(self._username, self._password)
+        log.warning("Switching MQTT client to bootstrap mode for self-serve activation.")
+        self._reconnect_with_current_credentials()
+
+    def _publish_bootstrap_hello(self):
+        payload = {
+            "serial_number": self._serial_number,
+            "ts": int(time() * 1000),
+            "bootstrap": True,
+        }
+        topic = f"v1/gateway/{self._serial_number}/bootstrap/hello"
+        self.publish(payload, topic)
 
     def _on_publish(self, client, userdata, mid, rc=None, properties=None):
         log.debug("Message %d published successfully.", mid)
@@ -395,6 +433,7 @@ class NovenaMqttPublisher:
         while not self._stopped and self._connected:
             storage_len = self._storage.len()
             if storage_len == 0:
+                self._last_replay_status = "complete"
                 log.info("SQLite database buffer is empty. Replay complete.")
                 break
                 
@@ -422,8 +461,18 @@ class NovenaMqttPublisher:
                 except Exception as e:
                     log.error("Failed to replay buffered event: %s", e)
             
-            # Indicate that pack processing is complete
-            self._storage.event_pack_processing_done()
+            # Only delete the batch when every event was accepted by the local
+            # MQTT client. Duplicates on partial failure are safer than data loss.
+            if success_count == len(pack):
+                self._storage.event_pack_processing_done()
+                self._last_replay_status = "success"
+            else:
+                self._last_replay_status = "partial_failure"
+                self._replay_failure_count += 1
+                log.warning(
+                    "Replay partially failed (%d/%d). Preserving batch for retry.",
+                    success_count, len(pack),
+                )
             log.info("Replayed %d of %d events from batch.", success_count, len(pack))
             sleep(0.5)
 
@@ -446,21 +495,34 @@ class NovenaMqttPublisher:
         if flush_count:
             log.info("Flushed %d messages before shutdown.", flush_count)
 
+    def collect_buffer_attributes(self) -> dict:
+        try:
+            buffered_count = self._storage.len()
+        except Exception:
+            buffered_count = None
+        return {
+            "buffered_event_count": buffered_count,
+            "last_replay_status": self._last_replay_status,
+            "replay_failure_count": self._replay_failure_count,
+        }
+
     # ─── Credential rotation (provision topic) ────────────────────────
 
     def _on_provision_message(self, topic: str, payload: dict):
         """Handle inbound provisioning commands (e.g. password rotation)."""
         action = payload.get("action")
-        if action == "rotate_password":
-            new_password = payload.get("new_password")
+        if action in ("rotate_password", "activate"):
+            mqtt_cfg = payload.get("mqtt") or {}
+            new_password = payload.get("new_password") or mqtt_cfg.get("password")
+            new_username = mqtt_cfg.get("username") or self._serial_number
             if not new_password:
-                log.error("Provision rotate_password: missing 'new_password'")
+                log.error("Provision %s: missing password", action)
                 return
-            self._rotate_password(new_password)
+            self._rotate_password(new_password, new_username, request_id=payload.get("request_id"), action=action)
         else:
             log.warning("Unknown provision action: %s", action)
 
-    def _rotate_password(self, new_password: str):
+    def _rotate_password(self, new_password: str, new_username: str = None, request_id: str = None, action: str = "rotate_password"):
         """
         Rotate MQTT credentials:
         1. Update config.json on disk
@@ -474,7 +536,10 @@ class NovenaMqttPublisher:
             try:
                 with open(self._config_path, 'r') as f:
                     config = json.load(f)
+                if new_username:
+                    config["mqtt"]["username"] = new_username
                 config["mqtt"]["password"] = new_password
+                config["mqtt"]["mode"] = "operational"
                 tmp_path = self._config_path + ".tmp"
                 with open(tmp_path, 'w') as f:
                     json.dump(config, f, indent=2)
@@ -485,13 +550,37 @@ class NovenaMqttPublisher:
                 return
 
         # 2. Update in-memory password
+        if new_username:
+            self._username = new_username
         self._password = new_password
+        self._bootstrap_mode = False
         self._client.username_pw_set(self._username, self._password)
+
+        try:
+            ack = {
+                "serial_number": self._serial_number,
+                "ts": int(time() * 1000),
+                "attributes": {
+                    "credential_update_status": "success",
+                    "credential_update_action": action,
+                    "credential_update_request_id": request_id,
+                }
+            }
+            self.publish_attributes(ack)
+        except Exception:
+            pass
 
         # 3. Disconnect (paho will auto-reconnect with the new credentials)
         log.info("Disconnecting to apply new credentials...")
+        self._reconnect_with_current_credentials()
+
+    def _reconnect_with_current_credentials(self):
         try:
             self._client.disconnect()
-        except Exception:
+        except Exception as e:
+            log.debug("MQTT disconnect before reconnect failed: %s", e)
+        try:
+            self._client.reconnect()
+        except Exception as e:
+            log.warning("MQTT reconnect with updated credentials failed: %s", e)
             pass
-        # paho-mqtt's loop_start() handles auto-reconnect

@@ -26,11 +26,12 @@ fi
 # 2. Extract new firmware in staging directory
 echo "Extracting payload..."
 mkdir -p "${NEW_RELEASE_DIR}"
-tar -xzf "${PAYLOAD_TAR}" -C "${NEW_RELEASE_DIR}" --strip-components=1 || {
-    # If it's a simulated payload, mock files
-    echo "Staging mock files for upgrade simulation..."
-    cp -r . "${NEW_RELEASE_DIR}"
-}
+tar -xzf "${PAYLOAD_TAR}" -C "${NEW_RELEASE_DIR}" --strip-components=1
+
+if [ ! -d "${NEW_RELEASE_DIR}/novena_gateway" ] || [ ! -f "${NEW_RELEASE_DIR}/requirements.txt" ]; then
+    echo "ERROR: Firmware payload is missing novena_gateway/ or requirements.txt"
+    exit 1
+fi
 
 # Write version file
 echo "__version__ = \"${VERSION}\"" > "${NEW_RELEASE_DIR}/novena_gateway/__version__.py"

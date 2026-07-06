@@ -18,6 +18,11 @@
       "ca_certs": "/opt/novena-gateway/certs/ca.crt"
     }
   },
+  "bootstrap_mqtt": {
+    "enabled": true,
+    "username": "bootstrap:REPLACE_WITH_SERIAL_NUMBER",
+    "password": "REPLACE_WITH_CLAIM_CODE"
+  },
   "logging": {
     "file": "/opt/novena-gateway/logs/novena-gateway.log",
     "max_bytes": 5242880,

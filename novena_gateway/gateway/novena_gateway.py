@@ -52,7 +52,10 @@ class NovenaGateway:
         self.stop_event = Event()
 
         # MQTT publisher
-        self._mqtt_publisher = NovenaMqttPublisher(self._config["mqtt"], serial_number=self._serial_number, config_path=config_path)
+        mqtt_config = dict(self._config["mqtt"])
+        if "bootstrap_mqtt" in self._config:
+            mqtt_config["bootstrap_mqtt"] = self._config["bootstrap_mqtt"]
+        self._mqtt_publisher = NovenaMqttPublisher(mqtt_config, serial_number=self._serial_number, config_path=config_path)
 
         # Payload formatter
         self._formatter = PayloadFormatter(self._serial_number)
@@ -131,6 +134,7 @@ class NovenaGateway:
         errors = []
 
         # Required top-level keys
+        deployment_mode = os.environ.get("NOVENA_DEPLOYMENT_MODE", "local").lower()
         if "gateway" not in config or "serial_number" not in config.get("gateway", {}):
             errors.append("gateway.serial_number")
         if "mqtt" not in config:
@@ -143,6 +147,19 @@ class NovenaGateway:
                 errors.append("mqtt.port")
         if "connectors" not in config or not isinstance(config.get("connectors"), list):
             errors.append("connectors (must be a list)")
+
+        if deployment_mode in ("pilot", "production"):
+            serial = config.get("gateway", {}).get("serial_number", "")
+            mqtt_cfg = config.get("mqtt", {})
+            placeholder_fields = {
+                "gateway.serial_number": serial,
+                "mqtt.host": mqtt_cfg.get("host", ""),
+                "mqtt.username": mqtt_cfg.get("username", ""),
+                "mqtt.password": mqtt_cfg.get("password", ""),
+            }
+            for field, value in placeholder_fields.items():
+                if not value or str(value).startswith("REPLACE_WITH_"):
+                    errors.append(f"{field} — factory burn value required in {deployment_mode} mode")
 
         # TLS cross-validation
         tls_cfg = config.get("mqtt", {}).get("tls")

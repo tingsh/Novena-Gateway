@@ -41,8 +41,10 @@ import json
 import logging
 import os
 import subprocess
+import hashlib
 from time import time, monotonic
 from typing import Optional
+from urllib.parse import urlparse
 
 log = logging.getLogger("novena_gateway.rpc_handler")
 
@@ -76,6 +78,7 @@ class RpcHandler:
             "read_device": self._cmd_read_device,
             "scan_devices": self._cmd_scan_devices,
             "update_firmware": self._cmd_update_firmware,
+            "network_preflight": self._cmd_network_preflight,
         }
 
     def start(self):
@@ -462,9 +465,17 @@ class RpcHandler:
         version = params.get("version")
         url = params.get("url")
         token = params.get("token")
+        expected_sha256 = params.get("sha256")
 
         if not version or not url:
             raise ValueError("Missing 'version' or 'url' parameter")
+        if not expected_sha256:
+            raise ValueError("Missing 'sha256' parameter")
+
+        parsed = urlparse(url)
+        allow_insecure = params.get("allow_insecure", False)
+        if parsed.scheme != "https" and not (allow_insecure or parsed.hostname in ("localhost", "127.0.0.1")):
+            raise ValueError("Firmware URL must use HTTPS")
 
         log.warning("OTA Firmware Update requested! Version: %s, URL: %s", version, url)
 
@@ -485,16 +496,18 @@ class RpcHandler:
         if token:
             req.add_header("Authorization", f"Bearer {token}")
 
-        try:
-            with urllib.request.urlopen(req) as response, open(dest_tar, 'wb') as out_file:
-                out_file.write(response.read())
-        except Exception as e:
-            # Fallback for local simulation if raw github download fails or we are offline
-            log.warning("Secure download failed (%s). Simulating file staging.", e)
-            with open(dest_tar, 'w') as f:
-                f.write("Simulated firmware payload")
+        with urllib.request.urlopen(req, timeout=60) as response, open(dest_tar, 'wb') as out_file:
+            out_file.write(response.read())
 
-        log.info("Download completed successfully. Launching upgrade script...")
+        actual_sha256 = self._sha256_file(dest_tar)
+        if actual_sha256.lower() != expected_sha256.lower():
+            try:
+                os.remove(dest_tar)
+            except OSError:
+                pass
+            raise ValueError("Firmware checksum mismatch")
+
+        log.info("Download and checksum verification completed. Launching upgrade script...")
 
         # OS-specific upgrade script execution
         if os.name == "nt":
@@ -519,8 +532,48 @@ class RpcHandler:
             )
 
         return {
-            "status": "success",
-            "message": "Firmware download complete. Upgrade process initiated.",
+            "status": "accepted",
+            "message": "Firmware verified. Upgrade process initiated.",
             "version": version
         }
 
+    def _cmd_network_preflight(self, params: dict) -> dict:
+        """Return network facts useful for customer-site troubleshooting."""
+        import shutil
+        import socket
+
+        def run_text(cmd):
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                return {"ok": res.returncode == 0, "output": (res.stdout or res.stderr).strip()[:1000]}
+            except Exception as e:
+                return {"ok": False, "output": str(e)}
+
+        mqtt_host = getattr(self._publisher, "_host", "")
+        mqtt_port = getattr(self._publisher, "_port", None)
+        mqtt_reachable = False
+        mqtt_error = ""
+        if mqtt_host and mqtt_port:
+            try:
+                with socket.create_connection((mqtt_host, mqtt_port), timeout=5):
+                    mqtt_reachable = True
+            except Exception as e:
+                mqtt_error = str(e)
+
+        return {
+            "ip_route": run_text(["ip", "route"]),
+            "dns": run_text(["getent", "hosts", mqtt_host]) if mqtt_host else {"ok": False, "output": "missing mqtt host"},
+            "mqtt": {"host": mqtt_host, "port": mqtt_port, "reachable": mqtt_reachable, "error": mqtt_error},
+            "nmcli_available": shutil.which("nmcli") is not None,
+            "mmcli_available": shutil.which("mmcli") is not None,
+            "wifi": run_text(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]) if shutil.which("nmcli") else None,
+            "modem": run_text(["mmcli", "-L"]) if shutil.which("mmcli") else None,
+        }
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()

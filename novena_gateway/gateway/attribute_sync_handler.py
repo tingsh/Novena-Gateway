@@ -152,6 +152,12 @@ class AttributeSyncHandler:
             except Exception as e:
                 log.warning("Failed to collect network watchdog attributes: %s", e)
 
+        if hasattr(self._gateway, "_mqtt_publisher") and self._gateway._mqtt_publisher:
+            try:
+                attrs.update(self._gateway._mqtt_publisher.collect_buffer_attributes())
+            except Exception as e:
+                log.warning("Failed to collect MQTT buffer attributes: %s", e)
+
         return attrs
 
     def _publish_attributes(self, status: str = "online"):
