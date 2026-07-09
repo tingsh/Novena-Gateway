@@ -30,6 +30,8 @@ Inbound Attribute Payload Schema (cloud → edge):
 """
 
 import logging
+import json
+import os
 import platform
 import socket
 import sys
@@ -152,13 +154,50 @@ class AttributeSyncHandler:
             except Exception as e:
                 log.warning("Failed to collect network watchdog attributes: %s", e)
 
+        if hasattr(self._gateway, "_connectivity_health") and self._gateway._connectivity_health:
+            try:
+                attrs.update(self._gateway._connectivity_health.collect_connectivity_attributes())
+            except Exception as e:
+                log.warning("Failed to collect connectivity health attributes: %s", e)
+
         if hasattr(self._gateway, "_mqtt_publisher") and self._gateway._mqtt_publisher:
             try:
                 attrs.update(self._gateway._mqtt_publisher.collect_buffer_attributes())
             except Exception as e:
                 log.warning("Failed to collect MQTT buffer attributes: %s", e)
 
+        if hasattr(self._gateway, "collect_device_health_summary"):
+            try:
+                attrs["device_health"] = self._gateway.collect_device_health_summary()
+            except Exception as e:
+                log.warning("Failed to collect device health attributes: %s", e)
+
+        try:
+            ota_status = self._collect_ota_status()
+            if ota_status:
+                attrs.update(ota_status)
+        except Exception as e:
+            log.warning("Failed to collect OTA status attributes: %s", e)
+
         return attrs
+
+    def _collect_ota_status(self) -> dict:
+        config = getattr(self._gateway, "_config", {})
+        storage_cfg = config.get("storage", {})
+        status_path = storage_cfg.get("ota_status_path")
+        if not status_path:
+            update_path = storage_cfg.get("update_path", "storage/update")
+            status_path = os.path.join(update_path, "ota_status.json")
+        if not os.path.exists(status_path):
+            return {}
+        with open(status_path, "r") as f:
+            payload = json.load(f)
+        return {
+            "ota_status": payload.get("ota_status"),
+            "ota_version": payload.get("ota_version"),
+            "ota_error": payload.get("ota_error"),
+            "ota_rollback_performed": payload.get("ota_rollback_performed", False),
+        }
 
     def _publish_attributes(self, status: str = "online"):
         """Publish current gateway attributes to the cloud."""

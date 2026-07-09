@@ -2,6 +2,8 @@
 
 import sys
 import os
+import json
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -14,9 +16,13 @@ class MockGateway:
     def __init__(self):
         self._connectors = []
         self._devices = {}
+        self._config = {}
 
     def get_devices(self):
         return self._devices
+
+    def collect_device_health_summary(self):
+        return {"Power Meter 1": {"poll_status": "healthy"}}
 
 
 class TestAttributeSyncHandler(unittest.TestCase):
@@ -43,6 +49,7 @@ class TestAttributeSyncHandler(unittest.TestCase):
         self.assertIn("connected_devices", attrs)
         self.assertIn("active_connectors", attrs)
         self.assertEqual(attrs["device_count"], 0)
+        self.assertIn("device_health", attrs)
 
     def test_collect_attributes_with_devices(self):
         """Device count should reflect registered devices."""
@@ -81,6 +88,24 @@ class TestAttributeSyncHandler(unittest.TestCase):
         if self.mock_publisher.publish_attributes.called:
             payload = self.mock_publisher.publish_attributes.call_args[0][0]
             self.assertEqual(payload["attributes"]["status"], "offline")
+
+    def test_collects_ota_status_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "ota_status.json")
+            with open(status_path, "w") as f:
+                json.dump({
+                    "ota_status": "rolled_back",
+                    "ota_version": "1.2.0",
+                    "ota_error": "health check failed",
+                    "ota_rollback_performed": True,
+                }, f)
+            self.mock_gateway._config = {"storage": {"ota_status_path": status_path}}
+
+            attrs = self.handler._collect_attributes()
+
+        self.assertEqual(attrs["ota_status"], "rolled_back")
+        self.assertEqual(attrs["ota_version"], "1.2.0")
+        self.assertTrue(attrs["ota_rollback_performed"])
 
 
 if __name__ == "__main__":

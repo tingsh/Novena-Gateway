@@ -13,11 +13,12 @@ import signal
 import sys
 from queue import SimpleQueue
 from threading import Event, Thread
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 
 import sdnotify
 
 from novena_gateway.gateway.attribute_sync_handler import AttributeSyncHandler
+from novena_gateway.gateway.connectivity_health_handler import ConnectivityHealthHandler
 from novena_gateway.gateway.constants import DEFAULT_CONNECTORS
 from novena_gateway.gateway.discovery_service import DiscoveryService
 from novena_gateway.gateway.entities.converted_data import ConvertedData
@@ -47,6 +48,7 @@ class NovenaGateway:
 
         # Internal state
         self._devices = {}          # device_name -> device_info
+        self._device_health = {}    # device_name -> runtime health details
         self._connectors = []       # list of running connector instances
         self._stopped = False
         self.stop_event = Event()
@@ -55,6 +57,8 @@ class NovenaGateway:
         mqtt_config = dict(self._config["mqtt"])
         if "bootstrap_mqtt" in self._config:
             mqtt_config["bootstrap_mqtt"] = self._config["bootstrap_mqtt"]
+        if "storage" in self._config:
+            mqtt_config["storage"] = self._config["storage"]
         self._mqtt_publisher = NovenaMqttPublisher(mqtt_config, serial_number=self._serial_number, config_path=config_path)
 
         # Payload formatter
@@ -73,6 +77,14 @@ class NovenaGateway:
         self._network_watchdog = NetworkWatchdogHandler(
             gateway=self,
             config=feature_cfg.get("network_watchdog", {}),
+        )
+
+        self._connectivity_health = ConnectivityHealthHandler(
+            gateway=self,
+            publisher=self._mqtt_publisher,
+            serial_number=self._serial_number,
+            mqtt_config=self._config.get("mqtt", {}),
+            config=feature_cfg.get("connectivity_health", {}),
         )
 
         # Remote logging handler
@@ -207,6 +219,7 @@ class NovenaGateway:
             "device_type": device_type,
             "connector": content.get("connector"),
         }
+        self._ensure_device_health(device_name)
         log.info("Device registered: %s (type=%s)", device_name, device_type)
         return True
 
@@ -214,6 +227,72 @@ class NovenaGateway:
         if device_name in self._devices:
             del self._devices[device_name]
             log.info("Device unregistered: %s", device_name)
+
+    def _ensure_device_health(self, device_name: str) -> dict:
+        if device_name not in self._device_health:
+            self._device_health[device_name] = {
+                "device_name": device_name,
+                "poll_status": "unknown",
+                "last_successful_poll_ts": None,
+                "last_failed_poll_ts": None,
+                "consecutive_failures": 0,
+                "last_error": None,
+                "last_error_type": None,
+                "last_response_ms": None,
+            }
+        return self._device_health[device_name]
+
+    def record_device_success(self, device_name: str, response_ms=None):
+        health = self._ensure_device_health(device_name)
+        health.update({
+            "poll_status": "healthy",
+            "last_successful_poll_ts": int(time() * 1000),
+            "consecutive_failures": 0,
+            "last_error": None,
+            "last_error_type": None,
+            "last_response_ms": response_ms,
+        })
+
+    def record_device_failure(self, device_name: str, error, error_type: str = None, response_ms=None):
+        health = self._ensure_device_health(device_name)
+        health["last_failed_poll_ts"] = int(time() * 1000)
+        health["consecutive_failures"] = int(health.get("consecutive_failures") or 0) + 1
+        health["last_error"] = str(error)
+        health["last_error_type"] = error_type or self.classify_device_error(error)
+        health["last_response_ms"] = response_ms
+        if health["last_error_type"] in ("invalid_function_code", "illegal_address", "decode_type_mismatch"):
+            health["poll_status"] = "misconfigured"
+        elif health["consecutive_failures"] >= 3:
+            health["poll_status"] = "offline"
+        else:
+            health["poll_status"] = "degraded"
+
+    def classify_device_error(self, error) -> str:
+        text = str(error).lower()
+        if "timeout" in text:
+            return "timeout"
+        if "connection refused" in text or "connect" in text and "failed" in text:
+            return "connection_refused"
+        if "function" in text and ("invalid" in text or "unknown" in text):
+            return "invalid_function_code"
+        if "illegal address" in text or "address" in text and "illegal" in text:
+            return "illegal_address"
+        if "decode" in text or "type" in text and "mismatch" in text:
+            return "decode_type_mismatch"
+        if "empty" in text or text in ("none", "{}"):
+            return "empty_response"
+        return "device_error"
+
+    def collect_device_health_summary(self) -> dict:
+        return {
+            name: dict(health)
+            for name, health in sorted(self._device_health.items())
+        }
+
+    def get_device_health(self, device_name: str = None) -> dict:
+        if device_name:
+            return dict(self._ensure_device_health(device_name))
+        return self.collect_device_health_summary()
 
     # ─── Data pathway (called by connectors) ─────────────────────────
 
@@ -246,6 +325,7 @@ class NovenaGateway:
     def _start_connectors(self):
         """Instantiate and start all connectors defined in config."""
         connectors_config = self._config.get("connectors", [])
+        results = []
 
         for connector_cfg in connectors_config:
             connector_type = connector_cfg["type"]
@@ -256,20 +336,45 @@ class NovenaGateway:
             class_name = DEFAULT_CONNECTORS.get(connector_type)
             if not class_name:
                 log.error("Unknown connector type: %s. Skipping.", connector_type)
+                results.append({
+                    "name": connector_name,
+                    "type": connector_type,
+                    "status": "error",
+                    "error": f"Unknown connector type: {connector_type}",
+                })
                 continue
 
             try:
                 connector_class = TBModuleLoader.import_module(connector_type, class_name)
                 if isinstance(connector_class, list):
                     log.error("Failed to load connector %s: %s", connector_type, connector_class)
+                    results.append({
+                        "name": connector_name,
+                        "type": connector_type,
+                        "status": "error",
+                        "error": str(connector_class),
+                    })
                     continue
 
                 connector = connector_class(self, connector_config, connector_type)
                 connector.open()
                 self._connectors.append(connector)
+                results.append({
+                    "name": connector_name,
+                    "type": connector_type,
+                    "status": "success",
+                    "error": None,
+                })
                 log.info("Started connector: %s (%s)", connector_name, connector_type)
             except Exception as e:
                 log.exception("Failed to start connector %s: %s", connector_name, e)
+                results.append({
+                    "name": connector_name,
+                    "type": connector_type,
+                    "status": "error",
+                    "error": str(e),
+                })
+        return results
 
     def _stop_connectors(self):
         """Stop all running connectors."""
@@ -323,6 +428,7 @@ class NovenaGateway:
 
         # Start cloud feature handlers (after MQTT is connected)
         self._network_watchdog.start()
+        self._connectivity_health.start()
         self._remote_log_handler.start()
         self._remote_log_handler.install()  # Install on root logger
         self._attribute_sync.start()
@@ -374,6 +480,7 @@ class NovenaGateway:
         self._rpc_handler.stop()
         self._remote_config.stop()
         self._attribute_sync.stop()
+        self._connectivity_health.stop()
         self._network_watchdog.stop()
         self._remote_log_handler.uninstall()
         self._remote_log_handler.stop()

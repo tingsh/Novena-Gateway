@@ -1,5 +1,5 @@
 #!/bin/bash
-# Novena Gateway — Installation Script
+# Novena Gateway - Installation Script
 # Run as root on Raspberry Pi or industrial gateway hardware.
 #
 # Usage: sudo bash install.sh
@@ -7,63 +7,74 @@
 set -e
 
 INSTALL_DIR="/opt/novena-gateway"
+CONFIG_DIR="/etc/novena-gateway"
+DATA_DIR="/var/lib/novena-gateway"
+LOG_DIR="/var/log/novena-gateway"
+RELEASE_DIR="$INSTALL_DIR/releases/novena-gateway-initial"
+CURRENT_LINK="$INSTALL_DIR/current"
 SERVICE_NAME="novena-gateway"
 
 echo "======================================"
-echo "  Novena Gateway — Installer"
+echo "  Novena Gateway - Installer"
 echo "======================================"
 
-# 1. Create installation directory
-echo "[1/6] Creating installation directory..."
+echo "[1/6] Creating installation directories..."
 mkdir -p "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR/certs"
-mkdir -p "$INSTALL_DIR/logs"
+mkdir -p "$RELEASE_DIR"
+mkdir -p "$CONFIG_DIR/certs"
+mkdir -p "$DATA_DIR/sqlite"
+mkdir -p "$DATA_DIR/update"
+mkdir -p "$DATA_DIR/config_backups"
+mkdir -p "$LOG_DIR"
 
-# 2. Copy files
-echo "[2/6] Copying files..."
-cp -r novena_gateway "$INSTALL_DIR/"
-cp config.json "$INSTALL_DIR/"
-cp requirements.txt "$INSTALL_DIR/"
+echo "[2/6] Copying release files..."
+cp -r novena_gateway "$RELEASE_DIR/"
+cp -r install "$RELEASE_DIR/"
+cp requirements.txt "$RELEASE_DIR/"
+ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
-# Copy CA certificate if present in installer bundle
-if [ -f "certs/ca.crt" ]; then
-    cp certs/ca.crt "$INSTALL_DIR/certs/"
-    echo "  → CA certificate installed."
+if [ ! -f "$CONFIG_DIR/config.json" ]; then
+    cp config.json "$CONFIG_DIR/config.json"
+    echo "  -> Config template installed to $CONFIG_DIR/config.json"
+else
+    echo "  -> Existing config preserved at $CONFIG_DIR/config.json"
 fi
 
-# 3. Create virtual environment
+if [ -f "certs/ca.crt" ]; then
+    cp certs/ca.crt "$CONFIG_DIR/certs/"
+    echo "  -> CA certificate installed."
+fi
+
 echo "[3/6] Setting up Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
-"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+"$INSTALL_DIR/venv/bin/pip" install -r "$RELEASE_DIR/requirements.txt"
 
-# 3.5 Create unprivileged user and assign permissions
-echo "[3.5/6] Creating unprivileged user..."
+echo "[3.5/6] Creating unprivileged user and assigning permissions..."
 useradd -r -s /bin/false -G dialout novena || true
 chown -R novena:novena "$INSTALL_DIR"
+chown -R novena:novena "$CONFIG_DIR"
+chown -R novena:novena "$DATA_DIR"
+chown -R novena:novena "$LOG_DIR"
 
-# 3.9 Pre-flight configuration validation check
-echo "[3.9/6] Running configuration validation check..."
-if "$INSTALL_DIR/venv/bin/python" -m novena_gateway.main --config "$INSTALL_DIR/config.json" --validate-only; then
-    echo "  ✓ Configuration file is valid."
+echo "[3.9/6] Running production configuration validation..."
+if NOVENA_DEPLOYMENT_MODE="${NOVENA_DEPLOYMENT_MODE:-pilot}" "$INSTALL_DIR/venv/bin/python" -m novena_gateway.main --config "$CONFIG_DIR/config.json" --validate-only; then
+    echo "  -> Configuration file is valid."
 else
     echo ""
-    echo "  ⚠ WARNING: Configuration validation failed!"
-    echo "  Novena Gateway may fail to run or connect until configured."
-    echo "  Please inspect and edit $INSTALL_DIR/config.json."
+    echo "  ERROR: Configuration validation failed."
+    echo "  Please inspect and edit $CONFIG_DIR/config.json before starting the service."
     echo ""
+    exit 1
 fi
 
-# 4. Install systemd service
 echo "[4/6] Installing systemd service..."
 cp novena-gateway.service /etc/systemd/system/
 systemctl daemon-reload
 
-# 5. Enable service
 echo "[5/6] Enabling service..."
 systemctl enable "$SERVICE_NAME"
 
-# 6. Start service
 echo "[6/6] Starting Novena Gateway..."
 systemctl start "$SERVICE_NAME"
 
@@ -74,7 +85,8 @@ echo "======================================"
 echo ""
 echo "  Status:  sudo systemctl status $SERVICE_NAME"
 echo "  Logs:    sudo journalctl -u $SERVICE_NAME -f"
-echo "  Config:  $INSTALL_DIR/config.json"
+echo "  Config:  $CONFIG_DIR/config.json"
+echo "  Data:    $DATA_DIR"
 echo "  Stop:    sudo systemctl stop $SERVICE_NAME"
 echo "  Restart: sudo systemctl restart $SERVICE_NAME"
 echo ""

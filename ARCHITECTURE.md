@@ -79,8 +79,9 @@ graph TD
 | **PayloadFormatter** | Converts `ConvertedData` from connectors into the Novena Hub JSON schema. |
 | **RemoteLogHandler** | Attaches to Python root logger. Buffers in a deque (500 max), flushes every 5 s in batches of 20. |
 | **AttributeSyncHandler** | Publishes heartbeat every 60 s (IP, uptime, firmware, devices, status). Handles inbound attribute push. |
-| **RemoteConfigHandler** | Receives config from cloud, validates, backs up, writes atomically, hot-reloads connectors, sends ACK. |
-| **RpcHandler** | Dispatches 10 commands: `ping`, `get_config`, `get_status`, `set_log_level`, `restart_connector`, `restart_all`, `reboot`, `get_devices`, `write_device`, `read_device`. |
+| **ConnectivityHealthHandler** | Periodically checks default route, DNS, broker TCP, TLS, MQTT state, and publishes actionable connectivity attributes. |
+| **RemoteConfigHandler** | Receives config from cloud, validates, backs up, writes atomically, hot-reloads connectors, rolls back failed connector starts, sends ACK. |
+| **RpcHandler** | Dispatches operational commands including config status, device health, network preflight, register preflight, `write_device`, and `read_device`. |
 | **Protocol Connectors (15)** | Modbus TCP/RTU, OPC-UA, MQTT bridge, BACnet, BLE, CAN, SNMP, REST, Socket, FTP, Request, KNX, OCPP, ODBC, XMPP. Unmodified from ThingsBoard Gateway. |
 
 ---

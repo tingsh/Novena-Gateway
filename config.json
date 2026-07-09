@@ -15,7 +15,7 @@
     "reconnect_delay_max": 60,
     "tls": {
       "mode": "one-way",
-      "ca_certs": "/opt/novena-gateway/certs/ca.crt"
+      "ca_certs": "/etc/novena-gateway/certs/ca.crt"
     }
   },
   "bootstrap_mqtt": {
@@ -23,8 +23,17 @@
     "username": "bootstrap:REPLACE_WITH_SERIAL_NUMBER",
     "password": "REPLACE_WITH_CLAIM_CODE"
   },
+  "storage": {
+    "sqlite": {
+      "data_file_path": "/var/lib/novena-gateway/sqlite/",
+      "max_read_records_count": 50,
+      "writing_batch_size": 50
+    },
+    "update_path": "/var/lib/novena-gateway/update",
+    "ota_status_path": "/var/lib/novena-gateway/ota_status.json"
+  },
   "logging": {
-    "file": "/opt/novena-gateway/logs/novena-gateway.log",
+    "file": "/var/log/novena-gateway/novena-gateway.log",
     "max_bytes": 5242880,
     "backup_count": 5
   },
@@ -40,9 +49,15 @@
       "enabled": true,
       "heartbeat_interval_seconds": 60
     },
+    "connectivity_health": {
+      "enabled": true,
+      "interval_seconds": 120,
+      "timeout_seconds": 5
+    },
     "remote_config": {
       "enabled": true,
-      "backup_dir": "config_backups"
+      "backup_dir": "/var/lib/novena-gateway/config_backups",
+      "last_known_good_path": "/var/lib/novena-gateway/last_known_good_config.json"
     },
     "rpc": {
       "enabled": true
@@ -54,6 +69,8 @@
       "rtu_slave_range": [1, 32],
       "rtu_baud_rates": [9600, 19200],
       "tcp_subnet_scan": true,
+      "tcp_hosts": [],
+      "tcp_ports": [502],
       "tcp_scan_timeout_ms": 500
     }
   },

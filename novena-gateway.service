@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=notify
 User=novena
-WorkingDirectory=/opt/novena-gateway
-ExecStart=/opt/novena-gateway/venv/bin/python -m novena_gateway.main --config /opt/novena-gateway/config.json
+WorkingDirectory=/opt/novena-gateway/current
+ExecStart=/opt/novena-gateway/venv/bin/python -m novena_gateway.main --config /etc/novena-gateway/config.json
 Restart=always
 RestartSec=10
 StandardOutput=journal

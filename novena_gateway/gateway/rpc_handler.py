@@ -68,6 +68,7 @@ class RpcHandler:
         self._commands = {
             "ping": self._cmd_ping,
             "get_config": self._cmd_get_config,
+            "get_config_status": self._cmd_get_config_status,
             "set_log_level": self._cmd_set_log_level,
             "restart_connector": self._cmd_restart_connector,
             "restart_all": self._cmd_restart_all,
@@ -76,6 +77,8 @@ class RpcHandler:
             "get_devices": self._cmd_get_devices,
             "write_device": self._cmd_write_device,
             "read_device": self._cmd_read_device,
+            "get_device_health": self._cmd_get_device_health,
+            "register_preflight": self._cmd_register_preflight,
             "scan_devices": self._cmd_scan_devices,
             "update_firmware": self._cmd_update_firmware,
             "network_preflight": self._cmd_network_preflight,
@@ -113,7 +116,13 @@ class RpcHandler:
         def execute():
             try:
                 result = handler(params)
-                self._send_response(request_id, method, status="success", result=result)
+                status = "success"
+                error = None
+                if method in ("read_device", "write_device", "register_preflight") and isinstance(result, dict):
+                    if result.get("error") or result.get("device_accepted") is False:
+                        status = "error"
+                        error = result.get("error") or "Device command was not accepted"
+                self._send_response(request_id, method, status=status, result=result, error=error)
             except Exception as e:
                 log.exception("RPC command '%s' failed: %s", method, e)
                 self._send_response(request_id, method, status="error", error=str(e))
@@ -152,6 +161,13 @@ class RpcHandler:
         with open(self._config_path, 'r') as f:
             config = json.load(f)
         return {"config": config}
+
+    def _cmd_get_config_status(self, params: dict) -> dict:
+        """Return the last remote config apply/rollback result."""
+        remote_config = getattr(self._gateway, "_remote_config", None)
+        if remote_config and hasattr(remote_config, "get_status"):
+            return remote_config.get_status()
+        return {"config_update_status": "unavailable"}
 
     def _cmd_set_log_level(self, params: dict) -> dict:
         """
@@ -287,6 +303,13 @@ class RpcHandler:
         """Return detailed device information."""
         return {"devices": self._gateway.get_devices()}
 
+    def _cmd_get_device_health(self, params: dict) -> dict:
+        """Return per-device health diagnostics."""
+        device_name = params.get("device_name")
+        if hasattr(self._gateway, "get_device_health"):
+            return {"device_health": self._gateway.get_device_health(device_name)}
+        return {"device_health": {}}
+
     # ─── Device control commands ──────────────────────────────────────
 
     def _find_connector_for_device(self, device_name: str):
@@ -320,6 +343,79 @@ class RpcHandler:
             "timeout": params.get("timeout", 5.0),
         }
 
+    def _validate_int_param(self, params: dict, name: str, *, minimum: int = 0, maximum: int = None) -> int:
+        if name not in params:
+            raise ValueError(f"Missing '{name}' parameter")
+        try:
+            value = int(params[name])
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid '{name}' parameter: must be an integer")
+        if value < minimum:
+            raise ValueError(f"Invalid '{name}' parameter: must be >= {minimum}")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"Invalid '{name}' parameter: must be <= {maximum}")
+        return value
+
+    def _validate_timeout(self, params: dict) -> float:
+        try:
+            timeout = float(params.get("timeout", 5.0))
+        except (TypeError, ValueError):
+            raise ValueError("Invalid 'timeout' parameter: must be a number")
+        if timeout < 0.1 or timeout > 60:
+            raise ValueError("Invalid 'timeout' parameter: must be between 0.1 and 60 seconds")
+        return timeout
+
+    def _find_response_error(self, response):
+        if response is None:
+            return "empty response from connector"
+        if isinstance(response, dict):
+            if response.get("success") is False:
+                return response.get("message") or "connector reported unsuccessful execution"
+            error = response.get("error")
+            if error:
+                return str(error)
+            for value in response.values():
+                nested = self._find_response_error(value)
+                if nested:
+                    return nested
+        if isinstance(response, list):
+            for item in response:
+                nested = self._find_response_error(item)
+                if nested:
+                    return nested
+        return None
+
+    def _extract_response_value(self, response):
+        if isinstance(response, dict):
+            if "value" in response:
+                return response["value"]
+            if "result" in response:
+                return response["result"]
+        return response
+
+    def _build_command_result(self, *, operation: str, device_name: str, function_code: int,
+                              address: int, raw_response, value=None, read_value=None,
+                              objects_count=None) -> dict:
+        error = self._find_response_error(raw_response)
+        result = {
+            "operation": operation,
+            "device_name": device_name,
+            "functionCode": function_code,
+            "address": address,
+            "gateway_received": True,
+            "connector_executed": raw_response is not None,
+            "device_accepted": error is None,
+            "raw_response": raw_response,
+            "error": error,
+        }
+        if value is not None:
+            result["value"] = value
+        if read_value is not None:
+            result["read_value"] = read_value
+        if objects_count is not None:
+            result["objectsCount"] = objects_count
+        return result
+
     def _cmd_write_device(self, params: dict) -> dict:
         """
         Write to a physical device via its connector.
@@ -341,42 +437,49 @@ class RpcHandler:
         function_code = params.get("functionCode")
         if function_code is None:
             raise ValueError("Missing 'functionCode' parameter")
+        function_code = int(function_code)
         if function_code not in (5, 6, 15, 16):
             raise ValueError(f"Invalid write functionCode: {function_code}. Must be 5, 6, 15, or 16")
 
-        if "address" not in params:
-            raise ValueError("Missing 'address' parameter")
+        address = self._validate_int_param(params, "address", minimum=0)
+        timeout = self._validate_timeout(params)
         if "value" not in params:
             raise ValueError("Missing 'value' parameter")
+        if params["value"] is None:
+            raise ValueError("Invalid 'value' parameter: value cannot be null")
 
         connector, _ = self._find_connector_for_device(device_name)
 
         # Build the RPC content in the format the connector expects
         rpc_params = {
             "functionCode": function_code,
-            "address": params["address"],
+            "address": address,
             "value": params["value"],
+            "timeout": timeout,
         }
         if "type" in params:
             rpc_params["type"] = params["type"]
         if "objectsCount" in params:
-            rpc_params["objectsCount"] = params["objectsCount"]
+            rpc_params["objectsCount"] = self._validate_int_param(params, "objectsCount", minimum=1, maximum=125)
 
         content = self._build_connector_rpc_content(device_name, "set", rpc_params)
 
         log.info("Writing to device '%s': FC=%d, addr=%d, value=%s",
-                 device_name, function_code, params["address"], params["value"])
+                 device_name, function_code, address, params["value"])
 
         response = connector.server_side_rpc_handler(content)
 
-        return {
-            "device_name": device_name,
-            "operation": "write",
-            "functionCode": function_code,
-            "address": params["address"],
-            "value": params["value"],
-            "response": response,
-        }
+        result = self._build_command_result(
+            operation="write",
+            device_name=device_name,
+            function_code=function_code,
+            address=address,
+            value=params["value"],
+            raw_response=response,
+            objects_count=rpc_params.get("objectsCount"),
+        )
+        self._record_command_health(device_name, result)
+        return result
 
     def _cmd_scan_devices(self, params: dict) -> dict:
         """
@@ -420,19 +523,22 @@ class RpcHandler:
         function_code = params.get("functionCode")
         if function_code is None:
             raise ValueError("Missing 'functionCode' parameter")
+        function_code = int(function_code)
         if function_code not in (1, 2, 3, 4):
             raise ValueError(f"Invalid read functionCode: {function_code}. Must be 1, 2, 3, or 4")
 
-        if "address" not in params:
-            raise ValueError("Missing 'address' parameter")
+        address = self._validate_int_param(params, "address", minimum=0)
+        objects_count = self._validate_int_param(params, "objectsCount", minimum=1, maximum=125) if "objectsCount" in params else 1
+        timeout = self._validate_timeout(params)
 
         connector, _ = self._find_connector_for_device(device_name)
 
         # Build the RPC content in the format the connector expects
         rpc_params = {
             "functionCode": function_code,
-            "address": params["address"],
-            "objectsCount": params.get("objectsCount", 1),
+            "address": address,
+            "objectsCount": objects_count,
+            "timeout": timeout,
         }
         if "type" in params:
             rpc_params["type"] = params["type"]
@@ -440,18 +546,33 @@ class RpcHandler:
         content = self._build_connector_rpc_content(device_name, "get", rpc_params)
 
         log.info("Reading from device '%s': FC=%d, addr=%d, count=%d",
-                 device_name, function_code, params["address"], rpc_params["objectsCount"])
+                 device_name, function_code, address, rpc_params["objectsCount"])
 
         response = connector.server_side_rpc_handler(content)
 
-        return {
-            "device_name": device_name,
-            "operation": "read",
-            "functionCode": function_code,
-            "address": params["address"],
-            "objectsCount": rpc_params["objectsCount"],
-            "response": response,
-        }
+        result = self._build_command_result(
+            operation="read",
+            device_name=device_name,
+            function_code=function_code,
+            address=address,
+            read_value=self._extract_response_value(response),
+            raw_response=response,
+            objects_count=objects_count,
+        )
+        self._record_command_health(device_name, result)
+        return result
+
+    def _cmd_register_preflight(self, params: dict) -> dict:
+        """Read a register on demand without storing it as telemetry."""
+        return self._cmd_read_device(params)
+
+    def _record_command_health(self, device_name: str, result: dict):
+        if not hasattr(self._gateway, "record_device_success"):
+            return
+        if result.get("device_accepted"):
+            self._gateway.record_device_success(device_name)
+        else:
+            self._gateway.record_device_failure(device_name, result.get("error") or "command failed")
 
     def _cmd_update_firmware(self, params: dict) -> dict:
         """
@@ -479,12 +600,15 @@ class RpcHandler:
 
         log.warning("OTA Firmware Update requested! Version: %s, URL: %s", version, url)
 
+        self._publish_ota_status("accepted", version=version, error=None, rollback=False)
+
         # Determine paths
         current_dir = os.path.dirname(os.path.abspath(__file__))
         base_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
         # Create staging directory
-        update_dir = os.path.join(base_dir, "storage", "update")
+        storage_cfg = getattr(self._gateway, "_config", {}).get("storage", {})
+        update_dir = storage_cfg.get("update_path") or os.path.join(base_dir, "storage", "update")
         os.makedirs(update_dir, exist_ok=True)
 
         dest_tar = os.path.join(update_dir, f"firmware_{version}.tar.gz")
@@ -505,6 +629,7 @@ class RpcHandler:
                 os.remove(dest_tar)
             except OSError:
                 pass
+            self._publish_ota_status("failed", version=version, error="Firmware checksum mismatch", rollback=False)
             raise ValueError("Firmware checksum mismatch")
 
         log.info("Download and checksum verification completed. Launching upgrade script...")
@@ -560,7 +685,13 @@ class RpcHandler:
             except Exception as e:
                 mqtt_error = str(e)
 
+        connectivity = None
+        health = getattr(self._gateway, "_connectivity_health", None)
+        if health and hasattr(health, "run_check"):
+            connectivity = health.run_check()
+
         return {
+            "connectivity": connectivity,
             "ip_route": run_text(["ip", "route"]),
             "dns": run_text(["getent", "hosts", mqtt_host]) if mqtt_host else {"ok": False, "output": "missing mqtt host"},
             "mqtt": {"host": mqtt_host, "port": mqtt_port, "reachable": mqtt_reachable, "error": mqtt_error},
@@ -577,3 +708,19 @@ class RpcHandler:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
         return h.hexdigest()
+
+    def _publish_ota_status(self, status: str, version: str = None, error: str = None, rollback: bool = False):
+        payload = {
+            "serial_number": self._serial_number,
+            "ts": int(time() * 1000),
+            "attributes": {
+                "ota_status": status,
+                "ota_version": version,
+                "ota_error": error,
+                "ota_rollback_performed": rollback,
+            },
+        }
+        try:
+            self._publisher.publish_attributes(payload)
+        except Exception:
+            pass

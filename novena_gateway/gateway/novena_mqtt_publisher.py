@@ -39,6 +39,7 @@ class NovenaMqttPublisher:
         self._client_id = config.get("client_id", "novena-gateway")
         self._tls = config.get("tls", None)
         self._bootstrap = config.get("bootstrap") or config.get("bootstrap_mqtt") or {}
+        self._storage_config = config.get("storage", {})
         self._max_queue_size = config.get("max_queue_size", 10000)
         self._reconnect_delay_min = config.get("reconnect_delay_min", 1)
         self._reconnect_delay_max = config.get("reconnect_delay_max", 60)
@@ -56,17 +57,22 @@ class NovenaMqttPublisher:
         self._connected = False
         self._stopped = False
         self._queue = Queue(maxsize=self._max_queue_size)
+        self._last_connection_rc = None
+        self._last_disconnect_rc = None
+        self._last_error = None
 
         # Inbound message routing: topic -> list of callbacks
         self._subscriptions: Dict[str, List[Callable]] = {}
         self._subscription_lock = threading.Lock()
 
         # Instantiate SQLiteEventStorage as local database buffer
+        sqlite_config = self._storage_config.get("sqlite", self._storage_config)
         storage_config = {
             "data_file_path": "storage/sqlite/",
             "max_read_records_count": 50,
             "writing_batch_size": 50,
         }
+        storage_config.update(sqlite_config or {})
         self._storage_stop_event = threading.Event()
         self._storage = SQLiteEventStorage(storage_config, log, self._storage_stop_event)
         self._replay_thread = None
@@ -280,10 +286,21 @@ class NovenaMqttPublisher:
     def is_connected(self):
         return self._connected
 
+    def get_connection_diagnostics(self) -> dict:
+        return {
+            "mqtt_connected": self._connected,
+            "mqtt_last_connection_rc": self._last_connection_rc,
+            "mqtt_last_disconnect_rc": self._last_disconnect_rc,
+            "mqtt_last_error": self._last_error,
+            "bootstrap_mode": self._bootstrap_mode,
+        }
+
     def _on_connect(self, client, userdata, flags, rc, properties=None):
+        self._last_connection_rc = rc
         if rc == 0 or rc == mqtt.MQTT_ERR_SUCCESS:
             log.info("Connected to MQTT broker at %s:%d", self._host, self._port)
             self._connected = True
+            self._last_error = None
             self._consecutive_failures = 0
             self._activation_message_shown = False
             # Re-subscribe to all registered topics on (re)connect
@@ -295,14 +312,17 @@ class NovenaMqttPublisher:
         else:
             log.error("MQTT connection failed with code %s", rc)
             self._connected = False
+            self._last_error = f"connect_failed_rc_{rc}"
             self._consecutive_failures += 1
             self._show_activation_message_if_needed()
             self._switch_to_bootstrap_if_needed()
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
         self._connected = False
+        self._last_disconnect_rc = rc
         if rc != 0 and rc != mqtt.MQTT_ERR_SUCCESS:
             log.warning("Unexpected MQTT disconnect (rc=%s). Will auto-reconnect.", rc)
+            self._last_error = f"unexpected_disconnect_rc_{rc}"
             self._consecutive_failures += 1
             self._show_activation_message_if_needed()
             self._switch_to_bootstrap_if_needed()

@@ -233,6 +233,7 @@ class AsyncModbusConnector(Connector, Thread):
 
     async def __poll_device(self, slave: Slave):
         self.__log.debug("Polling %s slave", slave)
+        poll_started = monotonic()
 
         # check if device have attributes or telemetry to poll
         if slave.uplink_converter_config.attributes or slave.uplink_converter_config.telemetry:
@@ -247,18 +248,25 @@ class AsyncModbusConnector(Connector, Thread):
 
                     if not self.__is_read_data_empty(slave_data):
                         self.__data_to_convert.put_nowait((slave, slave_data))
+                        self.__record_device_success(slave, poll_started)
+                    else:
+                        self.__record_device_failure(slave, "empty response", poll_started)
                 else:
                     self.__log.error('Device %s is not connected, cannot connect to server, skipping reading...', slave)
+                    self.__record_device_failure(slave, "failed to connect to device", poll_started)
                     self.__delete_device_from_platform(slave)
             except ConnectionException:
                 self.__delete_device_from_platform(slave)
+                self.__record_device_failure(slave, "connection exception", poll_started)
                 await asyncio.sleep(5)
                 self.__log.error('Failed to connect to device %s', slave)
             except asyncio.exceptions.TimeoutError:
                 self.__log.error('Timeout error for device %s', slave)
+                self.__record_device_failure(slave, "timeout", poll_started)
                 await slave.disconnect()
             except Exception as e:
                 self.__delete_device_from_platform(slave)
+                self.__record_device_failure(slave, e, poll_started)
                 self.__log.error('Failed to poll %s device: %s', slave, e)
                 self.__log.debug('Exception:', exc_info=e)
         else:
@@ -285,13 +293,35 @@ class AsyncModbusConnector(Connector, Thread):
                 except asyncio.exceptions.TimeoutError:
                     self.__log.error("Timeout error for device %s function code %s address %s, it may be caused by wrong data in server register.",  # noqa
                                      slave.device_name, config['functionCode'], config[ADDRESS_PARAMETER])
+                    if hasattr(self.__gateway, "record_device_failure"):
+                        self.__gateway.record_device_failure(
+                            slave.device_name,
+                            f"Timeout reading function code {config['functionCode']} address {config[ADDRESS_PARAMETER]}",
+                            error_type="timeout",
+                        )
                     continue
                 except ValueError as e:
                     self.__log.error("Value error for device %s function code %s address %s: %s", slave.device_name,
                                      config['functionCode'], config[ADDRESS_PARAMETER], e)
+                    if hasattr(self.__gateway, "record_device_failure"):
+                        self.__gateway.record_device_failure(
+                            slave.device_name,
+                            e,
+                            error_type=self.__gateway.classify_device_error(e) if hasattr(self.__gateway, "classify_device_error") else "device_error",
+                        )
                     continue
 
         return result
+
+    def __record_device_success(self, slave: Slave, started_at: float):
+        if hasattr(self.__gateway, "record_device_success"):
+            response_ms = int((monotonic() - started_at) * 1000)
+            self.__gateway.record_device_success(slave.device_name, response_ms=response_ms)
+
+    def __record_device_failure(self, slave: Slave, error, started_at: float):
+        if hasattr(self.__gateway, "record_device_failure"):
+            response_ms = int((monotonic() - started_at) * 1000)
+            self.__gateway.record_device_failure(slave.device_name, error, response_ms=response_ms)
 
     @staticmethod
     def __is_read_data_empty(data):

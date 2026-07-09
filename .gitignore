@@ -7,6 +7,7 @@ __pycache__/
 .DS_Store
 .env
 venv/
+.venv/
 .idea/
 .vscode/
 .eggs/
@@ -20,3 +21,12 @@ thingsboard-gateway/
 dist/
 build/
 *.egg
+
+# Runtime state
+storage/sqlite/
+storage/update/*.tar.gz
+config_backups/
+last_known_good_config.json
+*.db
+*.db-shm
+*.db-wal

@@ -14,6 +14,15 @@
     "reconnect_delay_min": 1,
     "reconnect_delay_max": 60
   },
+  "storage": {
+    "sqlite": {
+      "data_file_path": "storage/sqlite/",
+      "max_read_records_count": 50,
+      "writing_batch_size": 50
+    },
+    "update_path": "storage/update",
+    "ota_status_path": "storage/update/ota_status.json"
+  },
   "logging": {
     "file": "./novena-gateway.log",
     "max_bytes": 5242880,
@@ -31,9 +40,15 @@
       "enabled": true,
       "heartbeat_interval_seconds": 60
     },
+    "connectivity_health": {
+      "enabled": true,
+      "interval_seconds": 120,
+      "timeout_seconds": 5
+    },
     "remote_config": {
       "enabled": true,
-      "backup_dir": "config_backups"
+      "backup_dir": "config_backups",
+      "last_known_good_path": "last_known_good_config.json"
     },
     "rpc": {
       "enabled": true

@@ -29,6 +29,12 @@ class MockConnector:
         return "modbus"
 
 
+class ErrorConnector(MockConnector):
+    def server_side_rpc_handler(self, content):
+        self.last_rpc_content = content
+        return {"error": "Modbus timeout"}
+
+
 class MockGateway:
     def __init__(self):
         self._mock_connector = MockConnector()
@@ -40,6 +46,9 @@ class MockGateway:
             }
         }
         self._config = {"connectors": []}
+        self._device_health = {}
+        self._remote_config = MagicMock()
+        self._remote_config.get_status.return_value = {"config_update_status": "success"}
 
     def get_devices(self):
         return self._devices
@@ -49,6 +58,17 @@ class MockGateway:
 
     def _start_connectors(self):
         pass
+
+    def record_device_success(self, device_name, response_ms=None):
+        self._device_health[device_name] = {"poll_status": "healthy", "last_error": None}
+
+    def record_device_failure(self, device_name, error, error_type=None, response_ms=None):
+        self._device_health[device_name] = {"poll_status": "degraded", "last_error": str(error)}
+
+    def get_device_health(self, device_name=None):
+        if device_name:
+            return self._device_health.get(device_name, {})
+        return self._device_health
 
 
 class TestRpcHandler(unittest.TestCase):
@@ -157,6 +177,10 @@ class TestRpcHandler(unittest.TestCase):
         self.assertEqual(result["functionCode"], 6)
         self.assertEqual(result["address"], 100)
         self.assertEqual(result["value"], 1500)
+        self.assertTrue(result["gateway_received"])
+        self.assertTrue(result["connector_executed"])
+        self.assertTrue(result["device_accepted"])
+        self.assertIsNone(result["error"])
 
         # Verify the connector received the right content
         content = self.mock_gateway._mock_connector.last_rpc_content
@@ -182,6 +206,8 @@ class TestRpcHandler(unittest.TestCase):
         self.assertEqual(result["functionCode"], 3)
         self.assertEqual(result["address"], 3060)
         self.assertEqual(result["objectsCount"], 2)
+        self.assertTrue(result["device_accepted"])
+        self.assertEqual(result["read_value"], 42)
 
         content = self.mock_gateway._mock_connector.last_rpc_content
         self.assertEqual(content["data"]["method"], "get")
@@ -228,6 +254,53 @@ class TestRpcHandler(unittest.TestCase):
         """read_device should error when required params are missing."""
         with self.assertRaises(ValueError):
             self.handler._cmd_read_device({"device_name": "Power Meter 1"})
+
+    def test_write_device_rejects_malformed_address(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.handler._cmd_write_device({
+                "device_name": "Power Meter 1",
+                "functionCode": 6,
+                "address": "abc",
+                "value": 42,
+            })
+        self.assertIn("address", str(ctx.exception))
+
+    def test_read_device_rejects_bad_objects_count(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.handler._cmd_read_device({
+                "device_name": "Power Meter 1",
+                "functionCode": 3,
+                "address": 100,
+                "objectsCount": 0,
+            })
+        self.assertIn("objectsCount", str(ctx.exception))
+
+    def test_connector_error_normalizes_command_failure(self):
+        error_connector = ErrorConnector()
+        self.mock_gateway._devices["Power Meter 1"]["connector"] = error_connector
+
+        result = self.handler._cmd_write_device({
+            "device_name": "Power Meter 1",
+            "functionCode": 6,
+            "address": 100,
+            "value": 1500,
+        })
+
+        self.assertFalse(result["device_accepted"])
+        self.assertEqual(result["error"], "Modbus timeout")
+        self.assertEqual(self.mock_gateway._device_health["Power Meter 1"]["poll_status"], "degraded")
+
+    def test_get_device_health(self):
+        self.mock_gateway.record_device_failure("Power Meter 1", "timeout")
+
+        result = self.handler._cmd_get_device_health({"device_name": "Power Meter 1"})
+
+        self.assertEqual(result["device_health"]["last_error"], "timeout")
+
+    def test_get_config_status(self):
+        result = self.handler._cmd_get_config_status({})
+
+        self.assertEqual(result["config_update_status"], "success")
 
     def test_write_device_via_rpc_dispatch(self):
         """write_device should work through the full RPC dispatch path."""
