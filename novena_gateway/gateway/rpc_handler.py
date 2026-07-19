@@ -45,6 +45,9 @@ import hashlib
 from time import time, monotonic
 from typing import Optional
 from urllib.parse import urlparse
+from novena_gateway.gateway.hardware_preflight import run_preflight
+from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
+from novena_gateway.gateway.redaction import redact_secrets
 
 log = logging.getLogger("novena_gateway.rpc_handler")
 
@@ -63,6 +66,7 @@ class RpcHandler:
         self._enabled = self._handler_config.get("enabled", True)
         self._inbound_topic = f"v1/gateway/{self._serial_number}/rpc/request"
         self._start_time = monotonic()
+        self._helper = PrivilegedCommandRunner(self._handler_config.get("helper_path"))
 
         # Command dispatch table
         self._commands = {
@@ -82,6 +86,8 @@ class RpcHandler:
             "scan_devices": self._cmd_scan_devices,
             "update_firmware": self._cmd_update_firmware,
             "network_preflight": self._cmd_network_preflight,
+            "hardware_preflight": self._cmd_hardware_preflight,
+            "privilege_preflight": self._cmd_privilege_preflight,
         }
 
     def start(self):
@@ -143,7 +149,7 @@ class RpcHandler:
             "result": result,
             "error": error,
         }
-        self._publisher.publish_rpc_response(payload)
+        self._publisher.publish_rpc_response(redact_secrets(payload))
         log.debug("RPC response sent: method=%s, status=%s", method, status)
 
     # ─── Command implementations ──────────────────────────────────────
@@ -160,7 +166,7 @@ class RpcHandler:
         """Return the current config.json content."""
         with open(self._config_path, 'r') as f:
             config = json.load(f)
-        return {"config": config}
+        return {"config": redact_secrets(config)}
 
     def _cmd_get_config_status(self, params: dict) -> dict:
         """Return the last remote config apply/rollback result."""
@@ -254,9 +260,11 @@ class RpcHandler:
     def _cmd_restart_all(self, params: dict) -> dict:
         """Restart all connectors."""
         self._gateway._stop_connectors()
-        self._gateway._start_connectors()
+        results = self._gateway._start_connectors()
+        if hasattr(self._gateway, "_connector_start_results"):
+            self._gateway._connector_start_results = results or []
         count = len(self._gateway._connectors)
-        return {"connectors_restarted": count}
+        return {"connectors_restarted": count, "connector_results": results or []}
 
     def _cmd_reboot(self, params: dict) -> dict:
         """
@@ -266,14 +274,11 @@ class RpcHandler:
         delay = params.get("delay_seconds", 5)
         log.warning("REBOOT requested! Rebooting in %d seconds...", delay)
 
-        # Schedule reboot in background so we can still send the response
-        subprocess.Popen(
-            ["sh", "-c", f"sleep {delay} && sudo reboot"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        result = self._helper.reboot(delay)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("stderr") or "privileged reboot helper failed")
 
-        return {"reboot_scheduled": True, "delay_seconds": delay}
+        return {"reboot_scheduled": True, "delay_seconds": delay, "privilege": result}
 
     def _cmd_get_status(self, params: dict) -> dict:
         """Return a summary of the gateway's current status."""
@@ -297,6 +302,7 @@ class RpcHandler:
             "device_count": len(devices),
             "devices": list(devices.keys()),
             "connectors": connectors,
+            "runtime": self._gateway.collect_runtime_attributes() if hasattr(self._gateway, "collect_runtime_attributes") else {},
         }
 
     def _cmd_get_devices(self, params: dict) -> dict:
@@ -613,6 +619,7 @@ class RpcHandler:
 
         dest_tar = os.path.join(update_dir, f"firmware_{version}.tar.gz")
         log.info("Downloading firmware to %s...", dest_tar)
+        self._publish_ota_status("downloading", version=version, error=None, rollback=False)
 
         # Download payload securely in the background using urllib
         import urllib.request
@@ -632,6 +639,7 @@ class RpcHandler:
             self._publish_ota_status("failed", version=version, error="Firmware checksum mismatch", rollback=False)
             raise ValueError("Firmware checksum mismatch")
 
+        self._publish_ota_status("verified", version=version, error=None, rollback=False)
         log.info("Download and checksum verification completed. Launching upgrade script...")
 
         # OS-specific upgrade script execution
@@ -649,18 +657,25 @@ class RpcHandler:
             # Make sure it is executable
             os.chmod(upgrade_script, 0o755)
             log.info("Executing Linux atomic upgrade: %s", upgrade_script)
-            subprocess.Popen(
-                ["/bin/bash", upgrade_script, dest_tar, version],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd=base_dir
-            )
+            self._publish_ota_status("restarting", version=version, error=None, rollback=False)
+            helper_result = self._helper.run("run-upgrade", upgrade_script, dest_tar, version, timeout=10)
+            if not helper_result.get("ok"):
+                self._publish_ota_status("failed", version=version, error=helper_result.get("stderr"), rollback=False)
+                raise RuntimeError(helper_result.get("stderr") or "privileged OTA helper failed")
 
         return {
             "status": "accepted",
             "message": "Firmware verified. Upgrade process initiated.",
             "version": version
         }
+
+    def _cmd_hardware_preflight(self, params: dict) -> dict:
+        """Return CM4/Waveshare hardware readiness diagnostics."""
+        return run_preflight(getattr(self._gateway, "_config", {}))
+
+    def _cmd_privilege_preflight(self, params: dict) -> dict:
+        """Return scoped privileged helper diagnostics."""
+        return self._helper.diagnostics()
 
     def _cmd_network_preflight(self, params: dict) -> dict:
         """Return network facts useful for customer-site troubleshooting."""
@@ -690,7 +705,7 @@ class RpcHandler:
         if health and hasattr(health, "run_check"):
             connectivity = health.run_check()
 
-        return {
+        return redact_secrets({
             "connectivity": connectivity,
             "ip_route": run_text(["ip", "route"]),
             "dns": run_text(["getent", "hosts", mqtt_host]) if mqtt_host else {"ok": False, "output": "missing mqtt host"},
@@ -699,7 +714,8 @@ class RpcHandler:
             "mmcli_available": shutil.which("mmcli") is not None,
             "wifi": run_text(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]) if shutil.which("nmcli") else None,
             "modem": run_text(["mmcli", "-L"]) if shutil.which("mmcli") else None,
-        }
+            "privilege": self._helper.diagnostics(),
+        })
 
     @staticmethod
     def _sha256_file(path: str) -> str:

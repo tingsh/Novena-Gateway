@@ -70,6 +70,26 @@ class MockGateway:
             return self._device_health.get(device_name, {})
         return self._device_health
 
+    def collect_runtime_attributes(self):
+        return {"startup_status": "ready"}
+
+
+class FakeHelper:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls = []
+
+    def diagnostics(self):
+        return {"privilege_helper_available": self.ok}
+
+    def reboot(self, delay):
+        self.calls.append(("reboot", delay))
+        return {"ok": self.ok, "stderr": "" if self.ok else "helper missing"}
+
+    def run(self, action, *args, **kwargs):
+        self.calls.append((action, args, kwargs))
+        return {"ok": self.ok, "stderr": "" if self.ok else "helper missing"}
+
 
 class TestRpcHandler(unittest.TestCase):
 
@@ -81,7 +101,7 @@ class TestRpcHandler(unittest.TestCase):
         self.config_file = tempfile.NamedTemporaryFile(
             mode='w', suffix='.json', delete=False
         )
-        json.dump({"gateway": {"serial_number": "NF-TEST"}, "mqtt": {}, "connectors": []},
+        json.dump({"gateway": {"serial_number": "NF-TEST"}, "mqtt": {"password": "secret"}, "connectors": []},
                   self.config_file)
         self.config_file.close()
 
@@ -92,9 +112,13 @@ class TestRpcHandler(unittest.TestCase):
             config_path=self.config_file.name,
             config={"enabled": True}
         )
+        self.update_dir = tempfile.mkdtemp()
+        self.mock_gateway._config["storage"] = {"update_path": self.update_dir}
 
     def tearDown(self):
         os.unlink(self.config_file.name)
+        import shutil
+        shutil.rmtree(self.update_dir)
 
     def test_ping(self):
         """Ping RPC should return pong."""
@@ -108,6 +132,7 @@ class TestRpcHandler(unittest.TestCase):
         result = self.handler._cmd_get_config({})
         self.assertIn("config", result)
         self.assertEqual(result["config"]["gateway"]["serial_number"], "NF-TEST")
+        self.assertEqual(result["config"]["mqtt"]["password"], "[REDACTED]")
 
     def test_get_status(self):
         """get_status should return gateway status summary."""
@@ -131,6 +156,22 @@ class TestRpcHandler(unittest.TestCase):
         """restart_all should call stop and start connectors."""
         result = self.handler._cmd_restart_all({})
         self.assertIn("connectors_restarted", result)
+        self.assertIn("connector_results", result)
+
+    def test_reboot_uses_privileged_helper(self):
+        self.handler._helper = FakeHelper(ok=True)
+
+        result = self.handler._cmd_reboot({"delay_seconds": 1})
+
+        self.assertTrue(result["reboot_scheduled"])
+        self.assertEqual(self.handler._helper.calls[0], ("reboot", 1))
+
+    def test_privilege_preflight_reports_helper(self):
+        self.handler._helper = FakeHelper(ok=True)
+
+        result = self.handler._cmd_privilege_preflight({})
+
+        self.assertTrue(result["privilege_helper_available"])
 
     def test_on_rpc_request_dispatches(self):
         """Inbound RPC request should dispatch and publish response."""
@@ -350,8 +391,8 @@ class TestRpcHandler(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.__enter__.return_value.read.return_value = firmware_bytes
         
-        with patch('urllib.request.urlopen', return_value=mock_response) as mock_urlopen, \
-             patch('subprocess.Popen') as mock_popen:
+        self.handler._helper = FakeHelper(ok=True)
+        with patch('urllib.request.urlopen', return_value=mock_response) as mock_urlopen:
              
             result = self.handler._cmd_update_firmware({
                 "version": "1.2.0",
@@ -363,7 +404,7 @@ class TestRpcHandler(unittest.TestCase):
             self.assertEqual(result["status"], "accepted")
             self.assertEqual(result["version"], "1.2.0")
             mock_urlopen.assert_called_once()
-            mock_popen.assert_called_once()
+            self.assertEqual(self.handler._helper.calls[0][0], "run-upgrade")
 
     def test_update_firmware_rejects_missing_checksum(self):
         with self.assertRaises(ValueError):

@@ -40,6 +40,7 @@ from time import time, sleep, monotonic
 from typing import Optional
 
 from novena_gateway.__version__ import __version__
+from novena_gateway.gateway.redaction import redact_secrets
 
 log = logging.getLogger("novena_gateway.attribute_sync")
 
@@ -172,6 +173,12 @@ class AttributeSyncHandler:
             except Exception as e:
                 log.warning("Failed to collect device health attributes: %s", e)
 
+        if hasattr(self._gateway, "collect_runtime_attributes"):
+            try:
+                attrs.update(self._gateway.collect_runtime_attributes())
+            except Exception as e:
+                log.warning("Failed to collect runtime attributes: %s", e)
+
         try:
             ota_status = self._collect_ota_status()
             if ota_status:
@@ -179,7 +186,7 @@ class AttributeSyncHandler:
         except Exception as e:
             log.warning("Failed to collect OTA status attributes: %s", e)
 
-        return attrs
+        return redact_secrets(attrs)
 
     def _collect_ota_status(self) -> dict:
         config = getattr(self._gateway, "_config", {})

@@ -60,6 +60,7 @@ class NovenaMqttPublisher:
         self._last_connection_rc = None
         self._last_disconnect_rc = None
         self._last_error = None
+        self._dropped_message_count = 0
 
         # Inbound message routing: topic -> list of callbacks
         self._subscriptions: Dict[str, List[Callable]] = {}
@@ -261,11 +262,13 @@ class NovenaMqttPublisher:
                     self._queue.get_nowait()  # Drop oldest
                 except Empty:
                     pass
+                self._dropped_message_count += 1
                 self._queue.put_nowait(item)
         else:
             log.debug("Edge Gateway is offline. Buffering telemetry payload to SQLite database.")
             event_str = json.dumps({"topic": topic, "payload": payload})
-            self._storage.put(event_str)
+            if not self._storage.put(event_str):
+                self._dropped_message_count += 1
 
     def publish_telemetry(self, payload: dict):
         """Publish to the telemetry topic."""
@@ -431,11 +434,13 @@ class NovenaMqttPublisher:
                 if result.rc != mqtt.MQTT_ERR_SUCCESS:
                     log.warning("Publish failed (rc=%d) on %s, buffering to SQLite.", result.rc, topic)
                     event_str = json.dumps({"topic": topic, "payload": payload})
-                    self._storage.put(event_str)
+                    if not self._storage.put(event_str):
+                        self._dropped_message_count += 1
             else:
                 log.debug("Not connected in publish loop — buffering message to SQLite.")
                 event_str = json.dumps({"topic": topic, "payload": payload})
-                self._storage.put(event_str)
+                if not self._storage.put(event_str):
+                    self._dropped_message_count += 1
                 sleep(1)
 
     def _trigger_replay(self):
@@ -522,6 +527,8 @@ class NovenaMqttPublisher:
             buffered_count = None
         return {
             "buffered_event_count": buffered_count,
+            "publish_queue_size": self._queue.qsize(),
+            "dropped_message_count": self._dropped_message_count,
             "last_replay_status": self._last_replay_status,
             "replay_failure_count": self._replay_failure_count,
         }

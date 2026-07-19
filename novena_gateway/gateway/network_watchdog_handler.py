@@ -3,6 +3,7 @@ import subprocess
 import threading
 import time
 from typing import Optional
+from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 
 log = logging.getLogger("novena_gateway.network_watchdog")
 
@@ -19,6 +20,9 @@ class NetworkWatchdogHandler:
         self._config = config or {}
 
         self._enabled = self._config.get("enabled", True)
+        self._requested_mode = self._config.get("mode", "auto")
+        self._helper = PrivilegedCommandRunner(self._config.get("helper_path"))
+        self._watchdog_mode = self._resolve_mode()
         self._ping_target = self._config.get("ping_target", "8.8.8.8")
         self._ping_interval = self._config.get("ping_interval_seconds", 15)
         self._ping_timeout = self._config.get("ping_timeout_seconds", 3)
@@ -48,6 +52,15 @@ class NetworkWatchdogHandler:
         # Track consecutive failures or successes for healing
         self._consecutive_eth_successes = 0
 
+    def _resolve_mode(self) -> str:
+        if self._requested_mode == "diagnostic":
+            return "diagnostic"
+        if self._requested_mode == "active" and self._helper.available():
+            return "active"
+        if self._requested_mode == "active":
+            return "diagnostic"
+        return "active" if self._helper.available() else "diagnostic"
+
     def start(self):
         """Start the watchdog thread."""
         if not self._enabled:
@@ -55,6 +68,7 @@ class NetworkWatchdogHandler:
             return
 
         self._stopped = False
+        self._watchdog_mode = self._resolve_mode()
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, name="NetWatchdog", daemon=True
         )
@@ -66,7 +80,8 @@ class NetworkWatchdogHandler:
         self._stopped = True
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             self._watchdog_thread.join(timeout=3)
-        self._restore_default_metrics()
+        if self._watchdog_mode == "active":
+            self._restore_default_metrics()
         log.info("Network watchdog daemon stopped.")
 
     def _watchdog_loop(self):
@@ -186,19 +201,13 @@ class NetworkWatchdogHandler:
         if not interface:
             return
         log.info("Setting route metric for %s to %d", interface, metric)
+        if self._watchdog_mode != "active":
+            log.info("Network watchdog is in diagnostic mode; not changing route metric.")
+            return
         try:
-            subprocess.run(
-                ["nmcli", "connection", "modify", interface, "ipv4.route-metric", str(metric)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True
-            )
-            subprocess.run(
-                ["nmcli", "connection", "up", interface],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True
-            )
+            result = self._helper.set_route_metric(interface, metric)
+            if not result.get("ok"):
+                raise RuntimeError(result.get("stderr") or "privileged helper failed")
         except Exception as e:
             log.warning("Failed to modify route metric for %s to %d: %s", interface, metric, e)
 
@@ -248,4 +257,6 @@ class NetworkWatchdogHandler:
                 "wifi_status": self.wifi_status,
                 "fourg_status": self.fourg_status,
                 "signal_strength": self.signal_strength,
+                "watchdog_mode": self._watchdog_mode,
+                "privilege_helper_available": self._helper.available(),
             }

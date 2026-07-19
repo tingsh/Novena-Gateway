@@ -35,6 +35,7 @@ import os
 import shutil
 from time import time
 from typing import Optional
+from novena_gateway.gateway.redaction import redact_secrets
 
 log = logging.getLogger("novena_gateway.remote_config")
 
@@ -245,9 +246,13 @@ class RemoteConfigHandler:
             self._gateway._start_connectors(),
             new_config,
         )
+        if hasattr(self._gateway, "_connector_start_results"):
+            self._gateway._connector_start_results = connector_results
         failures = [result for result in connector_results if result.get("status") != "success"]
 
         if failures:
+            if hasattr(self._gateway, "_startup_status"):
+                self._gateway._startup_status = "degraded"
             error = "; ".join(
                 f"{item.get('name')}: {item.get('error') or item.get('status')}"
                 for item in failures
@@ -260,6 +265,8 @@ class RemoteConfigHandler:
                 self._gateway._start_connectors(),
                 rollback_config,
             )
+            if hasattr(self._gateway, "_connector_start_results"):
+                self._gateway._connector_start_results = rollback_results
             status = {
                 "config_update_status": "rolled_back",
                 "config_update_error": error,
@@ -274,6 +281,9 @@ class RemoteConfigHandler:
             return status
 
         self._write_last_known_good(new_config)
+        if hasattr(self._gateway, "_startup_status"):
+            self._gateway._startup_status = "ready"
+            self._gateway._startup_error = None
         status = {
             "config_update_status": "success",
             "config_update_error": None,
@@ -384,4 +394,4 @@ class RemoteConfigHandler:
                 "connector_results": connector_results or [],
             }
         }
-        self._publisher.publish_attributes(payload)
+        self._publisher.publish_attributes(redact_secrets(payload))

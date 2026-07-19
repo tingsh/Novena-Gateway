@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Narrow privileged helper for Novena Gateway service user.
+
+set -euo pipefail
+
+action="${1:-}"
+
+valid_iface() {
+    [[ "$1" =~ ^[A-Za-z0-9_.:-]+$ ]]
+}
+
+valid_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+case "$action" in
+    reboot)
+        delay="${2:-5}"
+        valid_int "$delay"
+        nohup sh -c "sleep '$delay' && /sbin/reboot" >/dev/null 2>&1 &
+        echo "reboot scheduled"
+        ;;
+    restart-service)
+        service="${2:-novena-gateway}"
+        [[ "$service" == "novena-gateway" ]]
+        systemctl restart "$service"
+        echo "service restarted"
+        ;;
+    set-route-metric)
+        iface="${2:?interface required}"
+        metric="${3:?metric required}"
+        valid_iface "$iface"
+        valid_int "$metric"
+        nmcli connection modify "$iface" ipv4.route-metric "$metric"
+        nmcli connection up "$iface"
+        echo "route metric updated"
+        ;;
+    configure-can)
+        iface="${2:-can0}"
+        bitrate="${3:-500000}"
+        valid_iface "$iface"
+        valid_int "$bitrate"
+        ip link set "$iface" down || true
+        ip link set "$iface" type can bitrate "$bitrate"
+        ip link set "$iface" up
+        echo "can configured"
+        ;;
+    run-upgrade)
+        script="${2:?upgrade script required}"
+        payload="${3:?payload tar required}"
+        version="${4:?version required}"
+        script_real="$(readlink -f "$script")"
+        payload_real="$(readlink -f "$payload")"
+        [[ "$script_real" == /opt/novena-gateway/current/install/upgrade.sh || "$script_real" == /opt/novena-gateway/releases/*/install/upgrade.sh ]]
+        [[ "$payload_real" == /var/lib/novena-gateway/update/* ]]
+        [[ -f "$script_real" ]]
+        nohup /bin/bash "$script_real" "$payload_real" "$version" >/var/log/novena-gateway/ota-upgrade.log 2>&1 &
+        echo "upgrade started"
+        ;;
+    *)
+        echo "Unknown or missing action: $action" >&2
+        exit 64
+        ;;
+esac

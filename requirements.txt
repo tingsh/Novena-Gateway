@@ -19,7 +19,8 @@ PySocks
 paho-mqtt>=1.6.0
 
 # Modbus (TCP + RTU)
-pymodbus>=3.8.0
+# Keep pinned until the gateway connector is migrated off APIs removed in newer pymodbus releases.
+pymodbus==3.8.0
 pyserial
 pyserial-asyncio
 

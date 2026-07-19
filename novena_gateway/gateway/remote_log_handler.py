@@ -27,6 +27,7 @@ import threading
 from collections import deque
 from time import time, sleep
 from typing import Optional
+from novena_gateway.gateway.redaction import redact_text
 
 log = logging.getLogger("novena_gateway.remote_log_handler")
 
@@ -104,7 +105,7 @@ class RemoteLogHandler(logging.Handler):
             "ts": int(record.created * 1000),
             "level": record.levelname,
             "logger": record.name,
-            "message": self.format(record),
+            "message": redact_text(self.format(record)),
             "module": record.module,
             "line": record.lineno,
         }

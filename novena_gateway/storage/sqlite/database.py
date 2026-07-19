@@ -272,7 +272,7 @@ class Database(Thread):
         if self.database_stopped_event.is_set():
             return
         try:
-            ts = (datetime.datetime.now() - datetime.timedelta(days=days)).timestamp()
+            ts = int((datetime.datetime.now() - datetime.timedelta(days=days)).timestamp() * 1000)
             data = self.db.execute_write(
                 """DELETE FROM messages WHERE timestamp <= ? ;""", [ts]
             )

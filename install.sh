@@ -50,12 +50,31 @@ python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -r "$RELEASE_DIR/requirements.txt"
 
-echo "[3.5/6] Creating unprivileged user and assigning permissions..."
+echo "[3.5/6] Creating unprivileged user, helper, and permissions..."
 useradd -r -s /bin/false -G dialout novena || true
+usermod -a -G dialout novena || true
+if getent group netdev >/dev/null; then
+    usermod -a -G netdev novena || true
+fi
 chown -R novena:novena "$INSTALL_DIR"
 chown -R novena:novena "$CONFIG_DIR"
 chown -R novena:novena "$DATA_DIR"
 chown -R novena:novena "$LOG_DIR"
+
+install -m 0755 "$RELEASE_DIR/install/novena-gateway-helper" /usr/local/sbin/novena-gateway-helper
+install -m 0440 "$RELEASE_DIR/install/novena-gateway-helper.sudoers" /etc/sudoers.d/novena-gateway-helper
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/novena-gateway-helper
+fi
+
+if [ "${NOVENA_SKIP_HARDWARE_SETUP:-0}" != "1" ]; then
+    echo "[3.6/6] Applying CM4/Waveshare hardware setup..."
+    bash "$RELEASE_DIR/install/hardware_setup.sh" || {
+        echo "  WARNING: Hardware setup did not complete. Run hardware_preflight before handoff."
+    }
+else
+    echo "[3.6/6] Skipping hardware setup because NOVENA_SKIP_HARDWARE_SETUP=1"
+fi
 
 echo "[3.9/6] Running production configuration validation..."
 if NOVENA_DEPLOYMENT_MODE="${NOVENA_DEPLOYMENT_MODE:-pilot}" "$INSTALL_DIR/venv/bin/python" -m novena_gateway.main --config "$CONFIG_DIR/config.json" --validate-only; then

@@ -70,18 +70,23 @@ class TestNetworkWatchdogHandler(unittest.TestCase):
         mock_file.read.return_value = "down\n"
         self.assertFalse(self.handler._is_interface_physically_up("eth0"))
 
-    @patch("subprocess.run")
-    def test_set_interface_metric(self, mock_run):
-        """Setting interface route metric calls nmcli correctly."""
+    def test_set_interface_metric(self):
+        """Setting interface route metric calls the privileged helper in active mode."""
+        self.handler._watchdog_mode = "active"
+        self.handler._helper = MagicMock()
+        self.handler._helper.set_route_metric.return_value = {"ok": True}
+
         self.handler._set_interface_metric("wlan0", 50)
-        
-        expected_calls = [
-            call(["nmcli", "connection", "modify", "wlan0", "ipv4.route-metric", "50"],
-                 stdout=subprocess_devnull(), stderr=subprocess_devnull(), check=True),
-            call(["nmcli", "connection", "up", "wlan0"],
-                 stdout=subprocess_devnull(), stderr=subprocess_devnull(), check=True)
-        ]
-        mock_run.assert_has_calls(expected_calls)
+
+        self.handler._helper.set_route_metric.assert_called_once_with("wlan0", 50)
+
+    def test_set_interface_metric_diagnostic_mode_does_not_mutate(self):
+        self.handler._watchdog_mode = "diagnostic"
+        self.handler._helper = MagicMock()
+
+        self.handler._set_interface_metric("wlan0", 50)
+
+        self.handler._helper.set_route_metric.assert_not_called()
 
     @patch("subprocess.run")
     def test_get_signal_strength_cellular(self, mock_run):

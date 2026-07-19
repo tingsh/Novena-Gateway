@@ -1,19 +1,15 @@
 {
   "gateway": {
-    "serial_number": "REPLACE_WITH_SERIAL_NUMBER"
-  },
-  "deployment": {
-    "mode": "pilot",
-    "required_connectors_enabled": true
+    "serial_number": "NOV-AUDIT-FACTORY-HW"
   },
   "mqtt": {
     "host": "REPLACE_WITH_MQTT_BROKER_HOST",
     "port": 8883,
     "topic": "v1/gateway/telemetry",
-    "username": "REPLACE_WITH_SERIAL_NUMBER",
+    "username": "NOV-AUDIT-FACTORY-HW",
     "password": "REPLACE_WITH_CLAIM_CODE",
     "qos": 1,
-    "client_id": "novena-gateway-REPLACE_WITH_SERIAL_NUMBER",
+    "client_id": "novena-gateway-NOV-AUDIT-FACTORY-HW",
     "max_queue_size": 100000,
     "reconnect_delay_min": 1,
     "reconnect_delay_max": 60,
@@ -24,7 +20,7 @@
   },
   "bootstrap_mqtt": {
     "enabled": true,
-    "username": "bootstrap:REPLACE_WITH_SERIAL_NUMBER",
+    "username": "bootstrap:NOV-AUDIT-FACTORY-HW",
     "password": "REPLACE_WITH_CLAIM_CODE"
   },
   "storage": {
@@ -51,19 +47,12 @@
     },
     "attribute_sync": {
       "enabled": true,
-      "heartbeat_interval_seconds": 60
+      "heartbeat_interval_seconds": 30
     },
     "connectivity_health": {
       "enabled": true,
-      "interval_seconds": 120,
+      "interval_seconds": 60,
       "timeout_seconds": 5
-    },
-    "network_watchdog": {
-      "enabled": true,
-      "mode": "auto",
-      "eth_interface": "eth0",
-      "wifi_interface": "wlan0",
-      "fourg_interface": "wwan0"
     },
     "remote_config": {
       "enabled": true,
@@ -76,26 +65,13 @@
     "discovery": {
       "enabled": true,
       "scan_on_boot": true,
-      "scan_interval_seconds": 3600,
-      "rtu_slave_range": [1, 32],
+      "scan_interval_seconds": 300,
+      "rtu_slave_range": [1, 8],
       "rtu_baud_rates": [9600, 19200],
       "tcp_subnet_scan": true,
-      "tcp_hosts": [],
+      "tcp_hosts": ["10.0.0.20:502"],
       "tcp_ports": [502],
       "tcp_scan_timeout_ms": 500
-    }
-  },
-  "hardware": {
-    "can": {
-      "interface": "can0",
-      "bitrate": 500000
-    },
-    "rs485": {
-      "uarts": ["uart3", "uart5"]
-    },
-    "rtc": {
-      "enabled": true,
-      "overlay": "i2c-rtc,pcf85063a"
     }
   },
   "connectors": []

@@ -13,16 +13,17 @@ import os
 import sys
 
 from novena_gateway.gateway.novena_gateway import NovenaGateway
+from novena_gateway.gateway.hardware_preflight import run_preflight
 
 
-def setup_logging(level="INFO", log_config=None):
+def setup_logging(level="INFO", log_config=None, enable_file=True):
     log_format = '%(asctime)s - |%(levelname)s| [%(name)s] - %(message)s'
     log_level = getattr(logging, level.upper(), logging.INFO)
 
     handlers = [logging.StreamHandler(sys.stdout)]
 
     # Add rotating file handler if configured
-    if log_config and log_config.get("file"):
+    if enable_file and log_config and log_config.get("file"):
         log_file = log_config["file"]
         max_bytes = log_config.get("max_bytes", 5 * 1024 * 1024)  # 5 MB default
         backup_count = log_config.get("backup_count", 5)
@@ -30,13 +31,21 @@ def setup_logging(level="INFO", log_config=None):
         # Ensure the log directory exists
         log_dir = os.path.dirname(log_file)
         if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+            except OSError as e:
+                print(f"WARNING: File logging disabled for {log_file}: {e}")
+                log_file = None
 
-        file_handler = RotatingFileHandler(
-            log_file, maxBytes=max_bytes, backupCount=backup_count
-        )
-        file_handler.setFormatter(logging.Formatter(log_format))
-        handlers.append(file_handler)
+        if log_file:
+            try:
+                file_handler = RotatingFileHandler(
+                    log_file, maxBytes=max_bytes, backupCount=backup_count
+                )
+                file_handler.setFormatter(logging.Formatter(log_format))
+                handlers.append(file_handler)
+            except OSError as e:
+                print(f"WARNING: File logging disabled for {log_file}: {e}")
 
     logging.basicConfig(
         level=log_level,
@@ -63,6 +72,11 @@ def main():
         action="store_true",
         help="Validate the config file and exit"
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Run read-only hardware preflight checks and exit"
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
@@ -83,7 +97,7 @@ def main():
         pass
 
     if args.validate_only:
-        setup_logging("WARNING", log_config=log_config)
+        setup_logging("WARNING", log_config=log_config, enable_file=False)
         errors = NovenaGateway.validate_config(config)
         if errors:
             print(f"Configuration is INVALID. Found {len(errors)} error(s):")
@@ -93,6 +107,11 @@ def main():
         else:
             print("Configuration is VALID.")
             sys.exit(0)
+
+    if args.preflight:
+        setup_logging("WARNING", log_config=log_config, enable_file=False)
+        print(json.dumps(run_preflight(config), indent=2))
+        sys.exit(0)
 
     setup_logging(args.log_level, log_config=log_config)
 

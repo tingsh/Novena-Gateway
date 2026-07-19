@@ -28,7 +28,7 @@ setup(
         "cryptography",
         "PySocks",
         "paho-mqtt>=1.6.0",
-        "pymodbus>=3.8.0",
+        "pymodbus==3.8.0",
         "pyserial",
         "pyserial-asyncio",
     ],

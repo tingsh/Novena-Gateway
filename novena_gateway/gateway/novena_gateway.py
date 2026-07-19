@@ -29,6 +29,7 @@ from novena_gateway.gateway.remote_log_handler import RemoteLogHandler
 from novena_gateway.gateway.rpc_handler import RpcHandler
 from novena_gateway.gateway.network_watchdog_handler import NetworkWatchdogHandler
 from novena_gateway.tb_utility.tb_loader import TBModuleLoader
+from novena_gateway.gateway.hardware_preflight import run_preflight
 
 log = logging.getLogger("novena_gateway.gateway")
 
@@ -50,6 +51,9 @@ class NovenaGateway:
         self._devices = {}          # device_name -> device_info
         self._device_health = {}    # device_name -> runtime health details
         self._connectors = []       # list of running connector instances
+        self._connector_start_results = []
+        self._startup_status = "initializing"
+        self._startup_error = None
         self._stopped = False
         self.stop_event = Event()
 
@@ -146,7 +150,7 @@ class NovenaGateway:
         errors = []
 
         # Required top-level keys
-        deployment_mode = os.environ.get("NOVENA_DEPLOYMENT_MODE", "local").lower()
+        deployment_mode = NovenaGateway.deployment_mode(config)
         if "gateway" not in config or "serial_number" not in config.get("gateway", {}):
             errors.append("gateway.serial_number")
         if "mqtt" not in config:
@@ -157,8 +161,32 @@ class NovenaGateway:
                 errors.append("mqtt.host")
             if "port" not in mqtt_cfg:
                 errors.append("mqtt.port")
+            else:
+                try:
+                    int(mqtt_cfg.get("port"))
+                except (TypeError, ValueError):
+                    errors.append("mqtt.port (must be an integer)")
+            if deployment_mode in ("pilot", "production"):
+                allow_insecure = bool(mqtt_cfg.get("allow_insecure_private_mqtt"))
+                if not mqtt_cfg.get("tls") and not allow_insecure:
+                    errors.append("mqtt.tls — required in pilot/production unless mqtt.allow_insecure_private_mqtt is true")
+                try:
+                    mqtt_port = int(mqtt_cfg.get("port", 1883))
+                    if allow_insecure and mqtt_port != 1883:
+                        errors.append("mqtt.allow_insecure_private_mqtt — only valid for plaintext/private MQTT on port 1883")
+                except (TypeError, ValueError):
+                    pass
         if "connectors" not in config or not isinstance(config.get("connectors"), list):
             errors.append("connectors (must be a list)")
+        else:
+            for index, connector in enumerate(config.get("connectors", [])):
+                if not isinstance(connector, dict):
+                    errors.append(f"connectors[{index}] (must be an object)")
+                    continue
+                if "type" not in connector:
+                    errors.append(f"connectors[{index}].type")
+                if "config" in connector and not isinstance(connector.get("config"), dict):
+                    errors.append(f"connectors[{index}].config (must be an object)")
 
         if deployment_mode in ("pilot", "production"):
             serial = config.get("gateway", {}).get("serial_number", "")
@@ -193,6 +221,12 @@ class NovenaGateway:
         return errors
 
     @staticmethod
+    def deployment_mode(config: dict = None) -> str:
+        config = config or {}
+        configured = config.get("deployment", {}).get("mode")
+        return (configured or os.environ.get("NOVENA_DEPLOYMENT_MODE", "local")).lower()
+
+    @staticmethod
     def _validate_config(config: dict, config_path: str):
         """Validate required config keys on startup. Exits with a clear message on failure."""
         errors = NovenaGateway.validate_config(config)
@@ -208,6 +242,9 @@ class NovenaGateway:
 
     def get_config_path(self) -> str:
         return os.path.dirname(self._config_path)
+
+    def run_hardware_preflight(self) -> dict:
+        return run_preflight(self._config)
 
     # ─── Device registry (called by connectors) ──────────────────────
 
@@ -299,6 +336,7 @@ class NovenaGateway:
     def send_to_storage(self, connector_name, connector_id, converted_data: ConvertedData):
         """Main data ingress point. Connectors call this to submit polled data."""
         self._data_queue.put((connector_name, converted_data))
+        return True
 
     def send_rpc_reply(self, device=None, req_id=None, content=None, **kwargs):
         """RPC replies — logged locally since we have no TB server to send to."""
@@ -376,6 +414,42 @@ class NovenaGateway:
                 })
         return results
 
+    def _required_connectors_enabled(self) -> bool:
+        deployment = self._config.get("deployment", {})
+        if "required_connectors_enabled" in deployment:
+            return bool(deployment["required_connectors_enabled"])
+        return self.deployment_mode(self._config) in ("pilot", "production")
+
+    def _is_connector_required(self, result: dict) -> bool:
+        if not self._required_connectors_enabled():
+            return False
+        for connector in self._config.get("connectors", []):
+            name = connector.get("name", connector.get("type"))
+            if name == result.get("name"):
+                return connector.get("required", True) is not False
+        return True
+
+    def _required_connector_failures(self) -> list:
+        return [
+            result for result in self._connector_start_results
+            if result.get("status") != "success" and self._is_connector_required(result)
+        ]
+
+    def collect_runtime_attributes(self) -> dict:
+        failures = self._required_connector_failures()
+        try:
+            data_queue_size = self._data_queue.qsize()
+        except Exception:
+            data_queue_size = None
+        return {
+            "startup_status": self._startup_status,
+            "startup_error": self._startup_error,
+            "connector_start_results": self._connector_start_results,
+            "required_connector_failures": failures,
+            "required_connector_failure_count": len(failures),
+            "data_queue_size": data_queue_size,
+        }
+
     def _stop_connectors(self):
         """Stop all running connectors."""
         for connector in self._connectors:
@@ -439,7 +513,25 @@ class NovenaGateway:
         self._discovery_service.start()
 
         # Start connectors
-        self._start_connectors()
+        self._connector_start_results = self._start_connectors()
+        required_failures = self._required_connector_failures()
+        if required_failures:
+            self._startup_status = "failed"
+            self._startup_error = "; ".join(
+                f"{item.get('name')}: {item.get('error') or item.get('status')}"
+                for item in required_failures
+            )
+            log.error("Required connector startup failed: %s", self._startup_error)
+            try:
+                self._attribute_sync._publish_attributes(status="failed")
+            except Exception:
+                pass
+            self.stop()
+            sys.exit(1)
+        if any(result.get("status") != "success" for result in self._connector_start_results):
+            self._startup_status = "degraded"
+        else:
+            self._startup_status = "ready"
 
         # Start data processing thread
         data_thread = Thread(target=self._data_processing_loop,

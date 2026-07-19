@@ -12,6 +12,7 @@ Supports:
 
 import glob
 import logging
+import subprocess
 import socket
 import struct
 import threading
@@ -50,6 +51,8 @@ class DiscoveryService:
         self._rtu_baud_rates = self._config.get("rtu_baud_rates", [9600, 19200])
         self._tcp_subnet_scan = self._config.get("tcp_subnet_scan", True)
         self._tcp_scan_timeout_ms = self._config.get("tcp_scan_timeout_ms", 500)
+        self._tcp_hosts = self._config.get("tcp_hosts", [])
+        self._tcp_ports = self._config.get("tcp_ports", [502])
 
         self._scan_thread = None
         self._periodic_thread = None
@@ -239,45 +242,88 @@ class DiscoveryService:
         devices = []
         timeout_s = self._tcp_scan_timeout_ms / 1000.0
 
-        # Get local IP and compute /24 subnet
-        local_ip = self._get_local_ip()
-        if not local_ip:
-            log.warning("Could not determine local IP for TCP scan")
-            return devices
+        targets = self._configured_tcp_targets()
+        if self._tcp_subnet_scan:
+            targets.extend(self._subnet_tcp_targets())
 
-        subnet_base = ".".join(local_ip.split(".")[:3])
-        log.info("Scanning TCP subnet %s.0/24 for Modbus devices...", subnet_base)
-
-        for host_part in range(1, 255):
+        seen_targets = set()
+        for ip, port in targets:
             if self._stopped:
                 break
-            ip = f"{subnet_base}.{host_part}"
-            if ip == local_ip:
+            key = (ip, int(port))
+            if key in seen_targets:
                 continue
-            try:
-                sock = socket.create_connection((ip, 502), timeout=timeout_s)
-                sock.close()
-                # Port 502 open — try Modbus read
-                client = ModbusTcpClient(ip, port=502, timeout=1)
-                if client.connect():
-                    result = client.read_holding_registers(0, 1, slave=1)
-                    if result and not result.isError():
-                        ident = self._identify_device_tcp(client, 1)
-                        device = {
-                            "interface": f"{ip}:502",
-                            "connection": "modbus_tcp",
-                            "slave_id": 1,
-                            "signature": ident.get("signature", "Unknown Modbus Device"),
-                            "identification": ident if ident.get("vendor") else None,
-                            "registers_found": self._count_registers(client, 1),
-                        }
-                        devices.append(device)
-                        log.info("Found TCP device: %s at %s", device["signature"], ip)
-                    client.close()
-            except (socket.timeout, ConnectionRefusedError, OSError):
-                pass
+            seen_targets.add(key)
+            device = self._probe_tcp_target(ModbusTcpClient, ip, int(port), timeout_s)
+            if device:
+                devices.append(device)
 
         return devices
+
+    def _configured_tcp_targets(self) -> list[tuple[str, int]]:
+        targets = []
+        for host in self._tcp_hosts:
+            if not host:
+                continue
+            if isinstance(host, dict):
+                ip = host.get("host") or host.get("ip")
+                port = int(host.get("port", 502))
+                if ip:
+                    targets.append((ip, port))
+                continue
+            host_str = str(host)
+            if ":" in host_str:
+                ip, port = host_str.rsplit(":", 1)
+                targets.append((ip, int(port) if port.isdigit() else 502))
+            else:
+                for port in self._tcp_ports:
+                    targets.append((host_str, int(port)))
+        return targets
+
+    def _subnet_tcp_targets(self) -> list[tuple[str, int]]:
+        targets = []
+        local_ips = self._get_local_ips()
+        if not local_ips:
+            log.warning("Could not determine local IPs for TCP scan")
+            return targets
+
+        for local_ip in local_ips:
+            subnet_base = ".".join(local_ip.split(".")[:3])
+            log.info("Scanning TCP subnet %s.0/24 for Modbus devices...", subnet_base)
+            for host_part in range(1, 255):
+                ip = f"{subnet_base}.{host_part}"
+                if ip == local_ip:
+                    continue
+                for port in self._tcp_ports:
+                    targets.append((ip, int(port)))
+        return targets
+
+    def _probe_tcp_target(self, client_class, ip: str, port: int, timeout_s: float) -> Optional[dict]:
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout_s)
+            sock.close()
+            client = client_class(ip, port=port, timeout=1)
+            if client.connect():
+                result = client.read_holding_registers(0, 1, slave=1)
+                if result and not result.isError():
+                    ident = self._identify_device_tcp(client, 1)
+                    device = {
+                        "interface": f"{ip}:{port}",
+                        "connection": "modbus_tcp",
+                        "slave_id": 1,
+                        "signature": ident.get("signature", "Unknown Modbus Device"),
+                        "identification": ident if ident.get("vendor") else None,
+                        "registers_found": self._count_registers(client, 1),
+                    }
+                    log.info("Found TCP device: %s at %s:%s", device["signature"], ip, port)
+                    client.close()
+                    return device
+            client.close()
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            pass
+        except Exception as e:
+            log.debug("TCP discovery probe failed for %s:%s: %s", ip, port, e)
+        return None
 
     # ─── Device identification ────────────────────────────────────────
 
@@ -355,6 +401,9 @@ class DiscoveryService:
 
     def _get_local_ip(self) -> Optional[str]:
         """Get the local IP address of the default interface."""
+        ips = self._get_local_ips()
+        if ips:
+            return ips[0]
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -363,6 +412,36 @@ class DiscoveryService:
             return ip
         except Exception:
             return None
+
+    def _get_local_ips(self) -> list[str]:
+        """Get non-loopback IPv4 addresses from all active local interfaces."""
+        ips = []
+        try:
+            output = subprocess.check_output(
+                ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    ip = parts[3].split("/", 1)[0]
+                    if ip and not ip.startswith("127.") and ip not in ips:
+                        ips.append(ip)
+        except Exception:
+            pass
+
+        if not ips:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+                s.close()
+                if ip and not ip.startswith("127."):
+                    ips.append(ip)
+            except Exception:
+                pass
+        return ips
 
     @staticmethod
     def _serial_label(port: str) -> str:
