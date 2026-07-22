@@ -36,6 +36,10 @@
     "update_path": "/var/lib/novena-gateway/update",
     "ota_status_path": "/var/lib/novena-gateway/ota_status.json"
   },
+  "ota": {
+    "public_key_path": "/etc/novena-gateway/trust/ota_vendor_ed25519.pub",
+    "trusted_key_ids": ["novena-ota-v1"]
+  },
   "logging": {
     "file": "/var/log/novena-gateway/novena-gateway.log",
     "max_bytes": 5242880,
