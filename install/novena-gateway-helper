@@ -46,15 +46,17 @@ case "$action" in
         echo "can configured"
         ;;
     run-upgrade)
-        script="${2:?upgrade script required}"
-        payload="${3:?payload tar required}"
-        version="${4:?version required}"
-        script_real="$(readlink -f "$script")"
+        payload="${2:?payload tar required}"
+        version="${3:?version required}"
+        manifest="${4:?manifest required}"
+        script_real="/opt/novena-gateway/current/install/upgrade.sh"
         payload_real="$(readlink -f "$payload")"
-        [[ "$script_real" == /opt/novena-gateway/current/install/upgrade.sh || "$script_real" == /opt/novena-gateway/releases/*/install/upgrade.sh ]]
+        manifest_real="$(readlink -f "$manifest")"
+        [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|canary)\.[0-9]+)?$ ]]
         [[ "$payload_real" == /var/lib/novena-gateway/update/* ]]
+        [[ "$manifest_real" == /var/lib/novena-gateway/update/* ]]
         [[ -f "$script_real" ]]
-        nohup /bin/bash "$script_real" "$payload_real" "$version" >/var/log/novena-gateway/ota-upgrade.log 2>&1 &
+        nohup /bin/bash "$script_real" "$payload_real" "$version" "$manifest_real" >/var/log/novena-gateway/ota-upgrade.log 2>&1 &
         echo "upgrade started"
         ;;
     *)

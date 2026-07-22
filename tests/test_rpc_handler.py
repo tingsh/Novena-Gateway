@@ -1,15 +1,23 @@
 """Unit tests for the RpcHandler."""
 
-import sys
-import os
+import base64
+import io
 import json
-import unittest
+import os
+import sys
+import tarfile
 import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from novena_gateway.gateway.rpc_handler import RpcHandler
+from novena_gateway.gateway.ota_security import canonical_manifest_bytes
 
 
 class MockConnector:
@@ -113,12 +121,71 @@ class TestRpcHandler(unittest.TestCase):
             config={"enabled": True}
         )
         self.update_dir = tempfile.mkdtemp()
+        self.ota_private_key = Ed25519PrivateKey.generate()
+        public_key = self.ota_private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.public_key_file = tempfile.NamedTemporaryFile(mode="w", suffix=".pub", delete=False)
+        self.public_key_file.write(base64.b64encode(public_key).decode("ascii"))
+        self.public_key_file.close()
         self.mock_gateway._config["storage"] = {"update_path": self.update_dir}
+        self.mock_gateway._config["ota"] = {"public_key_path": self.public_key_file.name}
 
     def tearDown(self):
         os.unlink(self.config_file.name)
+        os.unlink(self.public_key_file.name)
         import shutil
         shutil.rmtree(self.update_dir)
+
+    def _tar_bytes(self, unsafe_name=None):
+        content = io.BytesIO()
+        with tarfile.open(fileobj=content, mode="w:gz") as tar:
+            root = "novena-gateway-1.2.0"
+            for dirname in (root, f"{root}/novena_gateway"):
+                info = tarfile.TarInfo(dirname)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tar.addfile(info)
+            req = b"cryptography\n"
+            info = tarfile.TarInfo(f"{root}/requirements.txt")
+            info.size = len(req)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(req))
+            init = b""
+            info = tarfile.TarInfo(f"{root}/novena_gateway/__init__.py")
+            info.size = len(init)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(init))
+            if unsafe_name:
+                data = b"unsafe"
+                info = tarfile.TarInfo(unsafe_name)
+                info.size = len(data)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+        return content.getvalue()
+
+    def _signed_ota_params(self, firmware_bytes, **overrides):
+        import hashlib
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        manifest = {
+            "schema_version": 1,
+            "product": "novena-gateway",
+            "version": "1.2.0",
+            "artifact_url": "https://novena-hub/firmware/1.2.0.tar.gz",
+            "artifact_sha256": hashlib.sha256(firmware_bytes).hexdigest(),
+            "size_bytes": len(firmware_bytes),
+            "channel": "stable",
+            "issued_at": now.isoformat().replace("+00:00", "Z"),
+            "expires_at": (now + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+            "minimum_gateway_version": "0.1.0",
+            "maximum_gateway_version": "",
+            "key_id": "novena-ota-v1",
+        }
+        manifest.update(overrides)
+        signature = base64.b64encode(self.ota_private_key.sign(canonical_manifest_bytes(manifest))).decode("ascii")
+        return {"manifest": manifest, "signature": signature}
 
     def test_ping(self):
         """Ping RPC should return pong."""
@@ -382,36 +449,60 @@ class TestRpcHandler(unittest.TestCase):
         self.assertEqual(payload["result"]["operation"], "read")
 
     def test_update_firmware(self):
-        """update_firmware should download the firmware and run the upgrade script."""
-        # We can mock the urllib request to return successfully
-        import hashlib
+        """update_firmware should verify a signed manifest before running the upgrade."""
         from unittest.mock import patch
 
-        firmware_bytes = b"Mock zip/tar content"
+        firmware_bytes = self._tar_bytes()
         mock_response = MagicMock()
         mock_response.__enter__.return_value.read.return_value = firmware_bytes
         
         self.handler._helper = FakeHelper(ok=True)
         with patch('urllib.request.urlopen', return_value=mock_response) as mock_urlopen:
              
-            result = self.handler._cmd_update_firmware({
-                "version": "1.2.0",
-                "url": "https://novena-hub/firmware/1.2.0.tar.gz",
-                "token": "test_token",
-                "sha256": hashlib.sha256(firmware_bytes).hexdigest(),
-            })
+            result = self.handler._cmd_update_firmware(self._signed_ota_params(firmware_bytes))
             
             self.assertEqual(result["status"], "accepted")
             self.assertEqual(result["version"], "1.2.0")
             mock_urlopen.assert_called_once()
             self.assertEqual(self.handler._helper.calls[0][0], "run-upgrade")
+            self.assertEqual(self.handler._helper.calls[0][1][1], "1.2.0")
 
-    def test_update_firmware_rejects_missing_checksum(self):
+    def test_update_firmware_rejects_missing_signed_manifest(self):
         with self.assertRaises(ValueError):
             self.handler._cmd_update_firmware({
                 "version": "1.2.0",
                 "url": "https://novena-hub/firmware/1.2.0.tar.gz",
             })
+
+    def test_update_firmware_rejects_bad_signature(self):
+        firmware_bytes = self._tar_bytes()
+        params = self._signed_ota_params(firmware_bytes)
+        params["signature"] = base64.b64encode(b"bad signature").decode("ascii")
+        with self.assertRaises(ValueError):
+            self.handler._cmd_update_firmware(params)
+
+    def test_update_firmware_rejects_caller_insecure_override(self):
+        firmware_bytes = self._tar_bytes()
+        params = self._signed_ota_params(firmware_bytes)
+        params["allow_insecure"] = True
+        with self.assertRaises(ValueError):
+            self.handler._cmd_update_firmware(params)
+
+    def test_update_firmware_rejects_invalid_manifest_version(self):
+        firmware_bytes = self._tar_bytes()
+        params = self._signed_ota_params(firmware_bytes, version="../../bad")
+        with self.assertRaises(ValueError):
+            self.handler._cmd_update_firmware(params)
+
+    def test_update_firmware_rejects_unsafe_archive(self):
+        from unittest.mock import patch
+
+        firmware_bytes = self._tar_bytes(unsafe_name="../escape.txt")
+        mock_response = MagicMock()
+        mock_response.__enter__.return_value.read.return_value = firmware_bytes
+        with patch('urllib.request.urlopen', return_value=mock_response):
+            with self.assertRaises(ValueError):
+                self.handler._cmd_update_firmware(self._signed_ota_params(firmware_bytes))
 
 
 if __name__ == "__main__":

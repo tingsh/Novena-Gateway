@@ -3,7 +3,7 @@ Novena Gateway RPC Handler
 
 Subscribes to `v1/gateway/{serial_number}/rpc/request` for inbound RPC
 commands from Novena Hub. Dispatches commands and publishes results
-to `v1/gateway/rpc/response`.
+to `v1/gateway/{serial_number}/rpc/response`.
 
 Supported Commands:
 - ping                  → respond with pong + timestamp
@@ -44,8 +44,15 @@ import subprocess
 import hashlib
 from time import time, monotonic
 from typing import Optional
-from urllib.parse import urlparse
 from novena_gateway.gateway.hardware_preflight import run_preflight
+from novena_gateway.gateway.ota_security import (
+    DEFAULT_OTA_PUBLIC_KEY_PATH,
+    OtaSecurityError,
+    resolve_child_path,
+    safe_release_dir,
+    validate_tarball,
+    verify_manifest,
+)
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 from novena_gateway.gateway.redaction import redact_secrets
 
@@ -582,27 +589,41 @@ class RpcHandler:
 
     def _cmd_update_firmware(self, params: dict) -> dict:
         """
-        Download a firmware update and run the upgrade script.
+        Download a signed firmware update and run the upgrade script.
         params: {
-            "version": "1.2.0",
-            "url": "http://...",
-            "token": "..."
+            "manifest": {...},
+            "signature": "base64-ed25519-signature"
         }
         """
-        version = params.get("version")
-        url = params.get("url")
-        token = params.get("token")
-        expected_sha256 = params.get("sha256")
+        if params.get("allow_insecure"):
+            raise ValueError("Caller-controlled OTA HTTPS bypass is not allowed")
 
-        if not version or not url:
-            raise ValueError("Missing 'version' or 'url' parameter")
-        if not expected_sha256:
-            raise ValueError("Missing 'sha256' parameter")
+        manifest = params.get("manifest")
+        signature = params.get("signature")
+        if not manifest or not signature:
+            raise ValueError("Missing signed OTA manifest or signature")
 
-        parsed = urlparse(url)
-        allow_insecure = params.get("allow_insecure", False)
-        if parsed.scheme != "https" and not (allow_insecure or parsed.hostname in ("localhost", "127.0.0.1")):
-            raise ValueError("Firmware URL must use HTTPS")
+        ota_cfg = getattr(self._gateway, "_config", {}).get("ota", {})
+        public_key_path = ota_cfg.get(
+            "public_key_path",
+            self._handler_config.get("ota_public_key_path", DEFAULT_OTA_PUBLIC_KEY_PATH),
+        )
+        trusted_key_ids = ota_cfg.get("trusted_key_ids") or self._handler_config.get("ota_trusted_key_ids")
+        try:
+            trusted_manifest = verify_manifest(
+                manifest,
+                signature,
+                public_key_path=public_key_path,
+                trusted_key_ids=trusted_key_ids,
+            )
+        except OtaSecurityError as e:
+            self._publish_ota_status("failed", version=None, error=str(e), rollback=False)
+            raise ValueError(str(e))
+
+        version = trusted_manifest["version"]
+        url = trusted_manifest["artifact_url"]
+        expected_sha256 = trusted_manifest["artifact_sha256"]
+        expected_size = trusted_manifest["size_bytes"]
 
         log.warning("OTA Firmware Update requested! Version: %s, URL: %s", version, url)
 
@@ -617,18 +638,29 @@ class RpcHandler:
         update_dir = storage_cfg.get("update_path") or os.path.join(base_dir, "storage", "update")
         os.makedirs(update_dir, exist_ok=True)
 
-        dest_tar = os.path.join(update_dir, f"firmware_{version}.tar.gz")
+        install_dir = storage_cfg.get("install_path") or "/opt/novena-gateway"
+        safe_release_dir(install_dir, version)
+        dest_tar = resolve_child_path(update_dir, f"firmware_{version}.tar.gz")
+        manifest_path = resolve_child_path(update_dir, f"manifest_{version}.json")
         log.info("Downloading firmware to %s...", dest_tar)
         self._publish_ota_status("downloading", version=version, error=None, rollback=False)
 
-        # Download payload securely in the background using urllib
+        # Download payload securely in the background using urllib. The trusted
+        # checksum and URL come only from the verified manifest.
         import urllib.request
         req = urllib.request.Request(url)
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
 
         with urllib.request.urlopen(req, timeout=60) as response, open(dest_tar, 'wb') as out_file:
             out_file.write(response.read())
+
+        actual_size = os.path.getsize(dest_tar)
+        if actual_size != expected_size:
+            try:
+                os.remove(dest_tar)
+            except OSError:
+                pass
+            self._publish_ota_status("failed", version=version, error="Firmware size mismatch", rollback=False)
+            raise ValueError("Firmware size mismatch")
 
         actual_sha256 = self._sha256_file(dest_tar)
         if actual_sha256.lower() != expected_sha256.lower():
@@ -638,6 +670,19 @@ class RpcHandler:
                 pass
             self._publish_ota_status("failed", version=version, error="Firmware checksum mismatch", rollback=False)
             raise ValueError("Firmware checksum mismatch")
+
+        try:
+            validate_tarball(dest_tar)
+        except OtaSecurityError as e:
+            try:
+                os.remove(dest_tar)
+            except OSError:
+                pass
+            self._publish_ota_status("failed", version=version, error=str(e), rollback=False)
+            raise ValueError(str(e))
+
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(trusted_manifest, manifest_file, sort_keys=True, separators=(",", ":"))
 
         self._publish_ota_status("verified", version=version, error=None, rollback=False)
         log.info("Download and checksum verification completed. Launching upgrade script...")
@@ -653,12 +698,9 @@ class RpcHandler:
                 cwd=base_dir
             )
         else:
-            upgrade_script = os.path.join(base_dir, "install", "upgrade.sh")
-            # Make sure it is executable
-            os.chmod(upgrade_script, 0o755)
-            log.info("Executing Linux atomic upgrade: %s", upgrade_script)
+            log.info("Executing Linux atomic upgrade through scoped helper")
             self._publish_ota_status("restarting", version=version, error=None, rollback=False)
-            helper_result = self._helper.run("run-upgrade", upgrade_script, dest_tar, version, timeout=10)
+            helper_result = self._helper.run("run-upgrade", dest_tar, version, manifest_path, timeout=10)
             if not helper_result.get("ok"):
                 self._publish_ota_status("failed", version=version, error=helper_result.get("stderr"), rollback=False)
                 raise RuntimeError(helper_result.get("stderr") or "privileged OTA helper failed")

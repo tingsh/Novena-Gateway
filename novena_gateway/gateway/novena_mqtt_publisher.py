@@ -32,7 +32,6 @@ class NovenaMqttPublisher:
 
     def __init__(self, config: dict, serial_number: str = "", config_path: str = ""):
         self._host = config.get("host", "localhost")
-        self._telemetry_topic = config.get("topic", "v1/gateway/telemetry")
         self._username = config.get("username", "")
         self._password = config.get("password", "")
         self._qos = config.get("qos", 1)
@@ -45,6 +44,10 @@ class NovenaMqttPublisher:
         self._reconnect_delay_max = config.get("reconnect_delay_max", 60)
         self._serial_number = serial_number
         self._config_path = config_path
+        self._telemetry_topic = self._scoped_topic(
+            "telemetry",
+            legacy_fallback=config.get("topic", "v1/gateway/telemetry"),
+        )
 
         # Provisioning-mode tracking
         self._consecutive_failures = 0
@@ -108,6 +111,11 @@ class NovenaMqttPublisher:
 
         self._publish_thread = None
 
+    def _scoped_topic(self, suffix: str, legacy_fallback: str = None) -> str:
+        if self._serial_number:
+            return f"v1/gateway/{self._serial_number}/{suffix}"
+        return legacy_fallback or f"v1/gateway/{suffix}"
+
     def _configure_tls(self):
         """
         Configure TLS based on the 'tls' block in config.
@@ -162,7 +170,7 @@ class NovenaMqttPublisher:
         """
         Set MQTT Last Will and Testament (LWT).
         If the gateway disconnects unexpectedly, the broker publishes this
-        'offline' status message automatically on v1/gateway/attributes.
+        'offline' status message automatically on v1/gateway/{serial}/attributes.
         """
         if not self._serial_number:
             return
@@ -173,7 +181,7 @@ class NovenaMqttPublisher:
             "attributes": {"status": "offline"}
         })
         self._client.will_set(
-            topic="v1/gateway/attributes",
+            topic=self._scoped_topic("attributes", legacy_fallback="v1/gateway/attributes"),
             payload=lwt_payload,
             qos=1,
             retain=False,
@@ -270,21 +278,37 @@ class NovenaMqttPublisher:
             if not self._storage.put(event_str):
                 self._dropped_message_count += 1
 
+    def publish_now(self, payload: dict, topic: str) -> bool:
+        """Publish immediately and wait for the MQTT client to accept the message."""
+        if not self._connected:
+            return False
+        result = self._client.publish(topic, json.dumps(payload), qos=self._qos)
+        try:
+            result.wait_for_publish(timeout=5)
+        except Exception as e:
+            log.warning("Timed out waiting for publish on %s: %s", topic, e)
+            return False
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
+
     def publish_telemetry(self, payload: dict):
         """Publish to the telemetry topic."""
         self.publish(payload, self._telemetry_topic)
 
-    def publish_attributes(self, payload: dict):
+    def publish_attributes(self, payload: dict, *, immediate: bool = False):
         """Publish to the attributes topic."""
-        self.publish(payload, "v1/gateway/attributes")
+        topic = self._scoped_topic("attributes", legacy_fallback="v1/gateway/attributes")
+        if immediate:
+            return self.publish_now(payload, topic)
+        self.publish(payload, topic)
+        return True
 
     def publish_logs(self, payload: dict):
         """Publish to the logs topic."""
-        self.publish(payload, "v1/gateway/logs")
+        self.publish(payload, self._scoped_topic("logs", legacy_fallback="v1/gateway/logs"))
 
     def publish_rpc_response(self, payload: dict):
         """Publish to the RPC response topic."""
-        self.publish(payload, "v1/gateway/rpc/response")
+        self.publish(payload, self._scoped_topic("rpc/response", legacy_fallback="v1/gateway/rpc/response"))
 
     def is_connected(self):
         return self._connected
@@ -542,14 +566,22 @@ class NovenaMqttPublisher:
             mqtt_cfg = payload.get("mqtt") or {}
             new_password = payload.get("new_password") or mqtt_cfg.get("password")
             new_username = mqtt_cfg.get("username") or self._serial_number
+            request_id = payload.get("request_id")
             if not new_password:
                 log.error("Provision %s: missing password", action)
+                self._publish_credential_ack(action, request_id, "failed", "missing password")
                 return
-            self._rotate_password(new_password, new_username, request_id=payload.get("request_id"), action=action)
+            self._rotate_password(new_password, new_username, request_id=request_id, action=action)
         else:
             log.warning("Unknown provision action: %s", action)
 
-    def _rotate_password(self, new_password: str, new_username: str = None, request_id: str = None, action: str = "rotate_password"):
+    def _rotate_password(
+        self,
+        new_password: str,
+        new_username: str = None,
+        request_id: str = None,
+        action: str = "rotate_password",
+    ):
         """
         Rotate MQTT credentials:
         1. Update config.json on disk
@@ -574,6 +606,7 @@ class NovenaMqttPublisher:
                 log.info("Updated config.json with new MQTT password")
             except Exception as e:
                 log.error("Failed to update config.json during password rotation: %s", e)
+                self._publish_credential_ack(action, request_id, "failed", str(e))
                 return
 
         # 2. Update in-memory password
@@ -581,25 +614,33 @@ class NovenaMqttPublisher:
             self._username = new_username
         self._password = new_password
         self._bootstrap_mode = False
-        self._client.username_pw_set(self._username, self._password)
+        if hasattr(self, "_client"):
+            self._client.username_pw_set(self._username, self._password)
 
-        try:
-            ack = {
-                "serial_number": self._serial_number,
-                "ts": int(time() * 1000),
-                "attributes": {
-                    "credential_update_status": "success",
-                    "credential_update_action": action,
-                    "credential_update_request_id": request_id,
-                }
-            }
-            self.publish_attributes(ack)
-        except Exception:
-            pass
+        self._publish_credential_ack(action, request_id, "success")
 
         # 3. Disconnect (paho will auto-reconnect with the new credentials)
         log.info("Disconnecting to apply new credentials...")
         self._reconnect_with_current_credentials()
+
+    def _publish_credential_ack(self, action: str, request_id: str = None, status: str = "success", error: str = ""):
+        attributes = {
+            "credential_update_status": status,
+            "credential_update_action": action,
+            "credential_update_request_id": request_id,
+        }
+        if error:
+            attributes["credential_update_error"] = error
+        ack = {
+            "serial_number": self._serial_number,
+            "ts": int(time() * 1000),
+            "attributes": attributes,
+        }
+        try:
+            if not self.publish_attributes(ack, immediate=True):
+                log.warning("Credential %s acknowledgement was queued but not confirmed by MQTT.", action)
+        except Exception as e:
+            log.warning("Failed to publish credential %s acknowledgement: %s", action, e)
 
     def _reconnect_with_current_credentials(self):
         try:

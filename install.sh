@@ -10,6 +10,7 @@ INSTALL_DIR="/opt/novena-gateway"
 CONFIG_DIR="/etc/novena-gateway"
 DATA_DIR="/var/lib/novena-gateway"
 LOG_DIR="/var/log/novena-gateway"
+TRUST_DIR="$CONFIG_DIR/trust"
 RELEASE_DIR="$INSTALL_DIR/releases/novena-gateway-initial"
 CURRENT_LINK="$INSTALL_DIR/current"
 SERVICE_NAME="novena-gateway"
@@ -22,6 +23,7 @@ echo "[1/6] Creating installation directories..."
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$RELEASE_DIR"
 mkdir -p "$CONFIG_DIR/certs"
+mkdir -p "$TRUST_DIR"
 mkdir -p "$DATA_DIR/sqlite"
 mkdir -p "$DATA_DIR/update"
 mkdir -p "$DATA_DIR/config_backups"
@@ -44,6 +46,13 @@ if [ -f "certs/ca.crt" ]; then
     cp certs/ca.crt "$CONFIG_DIR/certs/"
     echo "  -> CA certificate installed."
 fi
+if [ -n "${NOVENA_OTA_PUBLIC_KEY_SRC:-}" ] && [ -f "$NOVENA_OTA_PUBLIC_KEY_SRC" ]; then
+    install -m 0644 "$NOVENA_OTA_PUBLIC_KEY_SRC" "$TRUST_DIR/ota_vendor_ed25519.pub"
+    echo "  -> OTA public verification key installed from NOVENA_OTA_PUBLIC_KEY_SRC."
+elif [ -f "trust/ota_vendor_ed25519.pub" ]; then
+    install -m 0644 "trust/ota_vendor_ed25519.pub" "$TRUST_DIR/ota_vendor_ed25519.pub"
+    echo "  -> OTA public verification key installed."
+fi
 
 echo "[3/6] Setting up Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/venv"
@@ -56,10 +65,16 @@ usermod -a -G dialout novena || true
 if getent group netdev >/dev/null; then
     usermod -a -G netdev novena || true
 fi
-chown -R novena:novena "$INSTALL_DIR"
+chown -R root:root "$INSTALL_DIR"
+chmod -R go-w "$INSTALL_DIR"
 chown -R novena:novena "$CONFIG_DIR"
 chown -R novena:novena "$DATA_DIR"
 chown -R novena:novena "$LOG_DIR"
+chown -R root:root "$TRUST_DIR"
+chmod 0755 "$TRUST_DIR"
+if [ -f "$TRUST_DIR/ota_vendor_ed25519.pub" ]; then
+    chmod 0644 "$TRUST_DIR/ota_vendor_ed25519.pub"
+fi
 
 install -m 0755 "$RELEASE_DIR/install/novena-gateway-helper" /usr/local/sbin/novena-gateway-helper
 install -m 0440 "$RELEASE_DIR/install/novena-gateway-helper.sudoers" /etc/sudoers.d/novena-gateway-helper

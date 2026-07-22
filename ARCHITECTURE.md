@@ -62,10 +62,10 @@ graph TD
 
 | Direction | Topic | Purpose |
 |-----------|-------|---------|
-| Edge → Cloud | `v1/gateway/telemetry` | Sensor data from field devices |
-| Edge → Cloud | `v1/gateway/logs` | Gateway log entries |
-| Edge → Cloud | `v1/gateway/attributes` | Status heartbeat (IP, uptime, firmware, devices) |
-| Edge → Cloud | `v1/gateway/rpc/response` | RPC command results |
+| Edge → Cloud | `v1/gateway/{sn}/telemetry` | Sensor data from field devices |
+| Edge → Cloud | `v1/gateway/{sn}/logs` | Gateway log entries |
+| Edge → Cloud | `v1/gateway/{sn}/attributes` | Status heartbeat (IP, uptime, firmware, devices) |
+| Edge → Cloud | `v1/gateway/{sn}/rpc/response` | RPC command results |
 | Cloud → Edge | `v1/gateway/{sn}/config` | Remote config push |
 | Cloud → Edge | `v1/gateway/{sn}/rpc/request` | RPC commands (ping, reboot, write_device, etc.) |
 | Cloud → Edge | `v1/gateway/{sn}/attributes/request` | Attribute push from cloud |
@@ -141,7 +141,7 @@ Entry point: `python -m novena_gateway.main --config config.json`
    {"serial_number": "NF-EDGE-001", "ts": 1714000000000,
     "values": {"device_name": "Power Meter 1", "active_power": 450.2}}
    ```
-5. `NovenaMqttPublisher.publish()` sends it via **QoS 1** to `v1/gateway/telemetry`
+5. `NovenaMqttPublisher.publish()` sends it via **QoS 1** to `v1/gateway/NF-EDGE-001/telemetry`
 6. **Cloud**: `mqtt_consumer` writes to TimescaleDB, dashboard renders the chart
 
 ### Flow 2 — Device Control (cloud → field device)
@@ -160,7 +160,7 @@ Entry point: `python -m novena_gateway.main --config config.json`
 5. `_find_connector_for_device("VFD Motor 1")` looks up the device registry to find the owning `ModbusConnector`
 6. `connector.server_side_rpc_handler(content)` executes the Modbus FC6 write
 7. Physical VFD motor speed register is updated — motor ramps up
-8. RpcHandler sends response to `v1/gateway/rpc/response`:
+8. RpcHandler sends response to `v1/gateway/NF-EDGE-001/rpc/response`:
    ```json
    {"status": "success", "result": {"operation": "write", ...}}
    ```
@@ -180,7 +180,7 @@ Entry point: `python -m novena_gateway.main --config config.json`
 5. **Backup** — copies current config to `config_backups/config_backup_{ts}.json` (keeps last 10)
 6. **Write** — writes new `config.json` atomically (`.tmp` file then `os.replace`)
 7. **Hot-reload** — stops all connectors, updates `gateway._config`, restarts connectors
-8. **ACK** — publishes to `v1/gateway/attributes`:
+8. **ACK** — publishes to `v1/gateway/NF-EDGE-001/attributes`:
    ```json
    {"config_update_status": "success", "config_update_request_id": "uuid"}
    ```
@@ -195,7 +195,7 @@ Entry point: `python -m novena_gateway.main --config config.json`
 3. **Skip** if level < `min_level` (default `INFO`) or if the logger is `novena_gateway.mqtt_publisher` (infinite loop guard)
 4. **Buffer** — appends to a `deque` (max 500 entries)
 5. **Flush thread** (every 5 s) batches up to 20 entries and calls `NovenaMqttPublisher.publish_logs()`
-6. Published to `v1/gateway/logs`:
+6. Published to `v1/gateway/NF-EDGE-001/logs`:
    ```json
    {"logs": [{"ts": ..., "level": "WARNING", "message": "Timeout polling Power Meter 1"}]}
    ```
@@ -208,7 +208,7 @@ Entry point: `python -m novena_gateway.main --config config.json`
 **Outbound heartbeat (every 60 s):**
 
 1. `AttributeSyncHandler` heartbeat thread collects: IP address, uptime, firmware version, connected devices, status
-2. Publishes to `v1/gateway/attributes`
+2. Publishes to `v1/gateway/NF-EDGE-001/attributes`
 3. **Cloud** updates the `Gateway` model fields (`ip_address`, `uptime_seconds`, `status`, etc.)
 
 **Graceful shutdown:**
@@ -267,7 +267,7 @@ Before connecting, the MQTT client registers a "last will" message with the brok
 {"serial_number": "NF-EDGE-001", "ts": ..., "attributes": {"status": "offline"}}
 ```
 
-If the gateway crashes, loses power, or the network drops, the broker automatically publishes this message after `keepalive × 1.5` seconds (~90s). The cloud receives it on `v1/gateway/attributes` and marks the gateway offline — no polling required.
+If the gateway crashes, loses power, or the network drops, the broker automatically publishes this message after `keepalive × 1.5` seconds (~90s). The cloud receives it on `v1/gateway/NF-EDGE-001/attributes` and marks the gateway offline — no polling required.
 
 ### Config Validation
 
@@ -338,7 +338,7 @@ The gateway is configured entirely through `config.json`. Below is the full stru
   "mqtt": {
     "host": "mqtt.${NOVENA_DOMAIN}",
     "port": 8883,
-    "topic": "v1/gateway/telemetry",
+    "topic": "v1/gateway/NF-EDGE-001/telemetry",
     "username": "NF-EDGE-001",
     "password": "random-token-here",
     "qos": 1,
@@ -414,7 +414,7 @@ The gateway is configured entirely through `config.json`. Below is the full stru
 |-----|------|---------|-------------|
 | `host` | string | `"localhost"` | **Required.** Mosquitto broker address. |
 | `port` | int | `1883` | **Required.** Use `8883` for TLS, `1883` for dev (no TLS). |
-| `topic` | string | `"v1/gateway/telemetry"` | Default telemetry publish topic. |
+| `topic` | string | `"v1/gateway/{serial}/telemetry"` | Default telemetry publish topic. |
 | `username` | string | `""` | MQTT auth username — set during provisioning. |
 | `password` | string | `""` | MQTT auth password — set during provisioning. |
 | `qos` | int | `1` | MQTT QoS level. `1` = at-least-once delivery. |

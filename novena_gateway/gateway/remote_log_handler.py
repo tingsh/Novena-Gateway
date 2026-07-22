@@ -2,7 +2,7 @@
 Novena Gateway Remote Log Handler
 
 A Python logging.Handler that buffers log records and periodically publishes
-them to Novena Hub via MQTT on the `v1/gateway/logs` topic.
+them to Novena Hub via MQTT on the `v1/gateway/{serial}/logs` topic.
 
 Log Payload Schema:
 {

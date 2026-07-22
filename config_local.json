@@ -5,7 +5,7 @@
   "mqtt": {
     "host": "127.0.0.1",
     "port": 1883,
-    "topic": "v1/gateway/telemetry",
+    "topic": "v1/gateway/12345678/telemetry",
     "username": "",
     "password": "",
     "qos": 1,

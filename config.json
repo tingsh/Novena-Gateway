@@ -9,7 +9,7 @@
   "mqtt": {
     "host": "REPLACE_WITH_MQTT_BROKER_HOST",
     "port": 8883,
-    "topic": "v1/gateway/telemetry",
+    "topic": "v1/gateway/REPLACE_WITH_SERIAL_NUMBER/telemetry",
     "username": "REPLACE_WITH_SERIAL_NUMBER",
     "password": "REPLACE_WITH_CLAIM_CODE",
     "qos": 1,
@@ -35,6 +35,10 @@
     },
     "update_path": "/var/lib/novena-gateway/update",
     "ota_status_path": "/var/lib/novena-gateway/ota_status.json"
+  },
+  "ota": {
+    "public_key_path": "/etc/novena-gateway/trust/ota_vendor_ed25519.pub",
+    "trusted_key_ids": ["novena-ota-v1"]
   },
   "logging": {
     "file": "/var/log/novena-gateway/novena-gateway.log",
