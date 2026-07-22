@@ -9,7 +9,7 @@
   "mqtt": {
     "host": "REPLACE_WITH_MQTT_BROKER_HOST",
     "port": 8883,
-    "topic": "v1/gateway/telemetry",
+    "topic": "v1/gateway/REPLACE_WITH_SERIAL_NUMBER/telemetry",
     "username": "REPLACE_WITH_SERIAL_NUMBER",
     "password": "REPLACE_WITH_CLAIM_CODE",
     "qos": 1,

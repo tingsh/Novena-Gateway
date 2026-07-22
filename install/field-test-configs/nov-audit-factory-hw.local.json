@@ -5,7 +5,7 @@
   "mqtt": {
     "host": "REPLACE_WITH_MQTT_BROKER_HOST",
     "port": 8883,
-    "topic": "v1/gateway/telemetry",
+    "topic": "v1/gateway/NOV-AUDIT-FACTORY-HW/telemetry",
     "username": "NOV-AUDIT-FACTORY-HW",
     "password": "REPLACE_WITH_CLAIM_CODE",
     "qos": 1,

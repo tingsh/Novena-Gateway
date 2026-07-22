@@ -3,7 +3,7 @@ Novena Gateway RPC Handler
 
 Subscribes to `v1/gateway/{serial_number}/rpc/request` for inbound RPC
 commands from Novena Hub. Dispatches commands and publishes results
-to `v1/gateway/rpc/response`.
+to `v1/gateway/{serial_number}/rpc/response`.
 
 Supported Commands:
 - ping                  → respond with pong + timestamp
