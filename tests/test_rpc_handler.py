@@ -448,40 +448,22 @@ class TestRpcHandler(unittest.TestCase):
         self.assertIn("disabled", payload["error"])
         self.assertIsNone(self.mock_gateway._mock_connector.last_rpc_content)
 
-    def test_locally_enabled_write_requires_canonical_identity(self):
+    def test_locally_enabled_write_still_requires_signed_retained_policy(self):
         self.handler._local_writeback_enabled = True
         self.handler._on_rpc_request("test/topic", {
             "request_id": "req-write-002",
             "method": "write_device",
             "schema_version": 1,
             "command_id": "command-002",
+            "idempotency_key": "idempotency-002",
+            "target": {
+                "gateway_serial": "NF-TEST-001",
+                "device_id": "device-001",
+            },
             "params": {
                 "device_id": "device-001",
                 "device_name": "Power Meter 1",
-                "functionCode": 6,
-                "address": 100,
-                "value": 1500,
-            },
-        })
-
-        for _ in range(100):
-            if self.mock_publisher.publish_rpc_response.call_count >= 2:
-                break
-            time.sleep(0.001)
-        payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
-        self.assertEqual(payload["status"], "success")
-        self.assertEqual(payload["result"]["operation"], "write")
-
-    def test_write_rejects_mutable_name_mismatch(self):
-        self.handler._local_writeback_enabled = True
-        self.handler._on_rpc_request("test/topic", {
-            "request_id": "req-write-003",
-            "method": "write_device",
-            "schema_version": 1,
-            "command_id": "command-003",
-            "params": {
-                "device_id": "device-001",
-                "device_name": "Renamed Device",
+                "command_key": "power_setpoint",
                 "functionCode": 6,
                 "address": 100,
                 "value": 1500,
@@ -494,7 +476,56 @@ class TestRpcHandler(unittest.TestCase):
             time.sleep(0.001)
         payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
         self.assertEqual(payload["status"], "error")
-        self.assertIn("does not match", payload["error"])
+        self.assertIn("Trusted clock", payload["error"])
+
+    def test_ota_reports_initiation_not_verified_execution(self):
+        self.handler._local_writeback_enabled = True
+        self.handler._governance.validate = MagicMock(return_value=({}, None))
+        self.handler._governance.enforce_prerequisites = MagicMock()
+        self.handler._governance.mark_executing = MagicMock()
+        self.handler._governance.mark_terminal = MagicMock()
+        self.handler._commands["update_firmware"] = lambda _params: {
+            "status": "accepted",
+            "message": "Upgrade initiated",
+        }
+        self.handler._on_rpc_request(
+            "test/topic",
+            {
+                "schema_version": 1,
+                "request_id": "req-ota-stage",
+                "command_id": "command-ota-stage",
+                "idempotency_key": "idempotency-ota-stage",
+                "target": {
+                    "gateway_serial": "NF-TEST-001",
+                    "device_id": "device-001",
+                },
+                "method": "update_firmware",
+                "params": {},
+            },
+        )
+
+        for _ in range(100):
+            if self.mock_publisher.publish_rpc_response.call_count >= 3:
+                break
+            time.sleep(0.001)
+        stages = [
+            call.args[0]["stage"]
+            for call in self.mock_publisher.publish_rpc_response.call_args_list
+        ]
+        self.assertEqual(stages, ["gateway_received", "executing", "ota_initiated"])
+        terminal = self.handler._governance.mark_terminal.call_args.kwargs
+        self.assertEqual(terminal["stage"], "ota_initiated")
+
+    def test_write_rejects_mutable_name_mismatch(self):
+        with self.assertRaises(ValueError) as raised:
+            self.handler._cmd_write_device({
+                "device_id": "device-001",
+                "device_name": "Renamed Device",
+                "functionCode": 6,
+                "address": 100,
+                "value": 1500,
+            })
+        self.assertIn("does not match", str(raised.exception))
 
     def test_read_device_via_rpc_dispatch(self):
         """read_device should work through the full RPC dispatch path."""
