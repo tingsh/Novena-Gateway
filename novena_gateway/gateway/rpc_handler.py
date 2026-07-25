@@ -145,6 +145,18 @@ class RpcHandler:
                 self._governance.policy_revision,
                 self._governance.control_epoch,
             )
+            self._publisher.publish_attributes(
+                {
+                    "serial_number": self._serial_number,
+                    "ts": int(time() * 1000),
+                    "attributes": {
+                        **self._governance.readiness(),
+                        "remote_control_policy_ack_revision": self._governance.policy_revision,
+                        "remote_control_policy_ack_epoch": self._governance.control_epoch,
+                    },
+                },
+                immediate=True,
+            )
         except GovernedCommandRejected as exc:
             log.warning("Rejected governed-control policy: %s", exc)
 
@@ -256,6 +268,38 @@ class RpcHandler:
                         if result.get("error") or result.get("device_accepted") is False:
                             status = "error"
                             error = result.get("error") or "Device command was not accepted"
+                    if method == "write_device" and status == "success":
+                        readback = governed_control.get("readback") or {}
+                        if readback.get("required"):
+                            read_result = self._cmd_read_device(
+                                {
+                                    "device_name": params["device_name"],
+                                    "functionCode": int(readback.get("functionCode", 3)),
+                                    "address": int(readback.get("address", params["address"])),
+                                    "objectsCount": int(readback.get("objectsCount", 1)),
+                                    "type": readback.get("type", params.get("type")),
+                                }
+                            )
+                            actual = read_result.get("read_value")
+                            tolerance = float(readback.get("tolerance", 0))
+                            expected = float(params["expected_value"])
+                            if actual is None or abs(float(actual) - expected) > tolerance:
+                                status = "error"
+                                error = "Post-write verification mismatch"
+                                result["verification"] = {
+                                    "status": "mismatch",
+                                    "expected": expected,
+                                    "actual": actual,
+                                    "tolerance": tolerance,
+                                    "critical": governed_control.get("risk") == "critical",
+                                }
+                            else:
+                                result["verification"] = {
+                                    "status": "verified",
+                                    "expected": expected,
+                                    "actual": actual,
+                                    "tolerance": tolerance,
+                                }
                     stage = "field_protocol_accepted" if status == "success" else "failed"
                     if method not in ("read_device", "write_device", "register_preflight"):
                         stage = "executed" if status == "success" else "failed"
