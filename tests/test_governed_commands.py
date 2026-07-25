@@ -96,6 +96,7 @@ class GovernedCommandGuardTest(unittest.TestCase):
         now = datetime.now(timezone.utc)
         body = {
             "schema_version": 1,
+            "request_id": "request-1",
             "command_id": "command-1",
             "idempotency_key": "idempotency-1",
             "target": {"gateway_serial": "GW-001", "device_id": "device-1"},

@@ -60,10 +60,10 @@ from novena_gateway.gateway.ota_security import (
 )
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 from novena_gateway.gateway.redaction import redact_secrets
+from novena_gateway.gateway.remote_control_protocol import REMOTE_CONTROL_PROTOCOL_VERSION
 
 log = logging.getLogger("novena_gateway.rpc_handler")
 
-REMOTE_CONTROL_PROTOCOL_VERSION = 1
 STATE_CHANGING_COMMANDS = {
     "set_log_level",
     "restart_connector",
@@ -178,11 +178,15 @@ class RpcHandler:
         if not isinstance(payload, dict):
             log.warning("Rejected malformed RPC payload: expected an object")
             return
-        request_id = payload.get("request_id", "unknown")
+        request_id = payload.get("request_id")
         method = payload.get("method", "")
         params = payload.get("params", {})
 
         log.info("RPC request received: method=%s, request_id=%s", method, request_id)
+
+        if not isinstance(request_id, str) or not request_id.strip():
+            log.warning("Rejected RPC payload without request_id")
+            return
 
         handler = self._commands.get(method)
         if not handler:
@@ -226,12 +230,30 @@ class RpcHandler:
                     stage="rejected",
                 )
                 return
-            if method == "write_device" and not params.get("device_id"):
+            target = payload.get("target")
+            if (
+                not payload.get("idempotency_key")
+                or not isinstance(target, dict)
+                or target.get("gateway_serial") != self._serial_number
+            ):
                 self._send_response(
                     request_id,
                     method,
                     status="error",
-                    error="Governed device writes require canonical device_id",
+                    error="Governed commands require canonical command and Gateway identity",
+                    stage="rejected",
+                )
+                return
+            if method == "write_device" and (
+                not params.get("device_id")
+                or not params.get("command_key")
+                or str(target.get("device_id")) != str(params.get("device_id"))
+            ):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed device writes require one canonical device_id and command_key",
                     stage="rejected",
                 )
                 return
@@ -274,6 +296,12 @@ class RpcHandler:
                     if method in STATE_CHANGING_COMMANDS:
                         self._governance.enforce_prerequisites(governed_control, params)
                         self._governance.mark_executing(payload)
+                        self._send_response(
+                            request_id,
+                            method,
+                            status="processing",
+                            stage="executing",
+                        )
                     result = handler(params)
                     status = "success"
                     error = None
@@ -313,9 +341,20 @@ class RpcHandler:
                                     "actual": actual,
                                     "tolerance": tolerance,
                                 }
-                    stage = "field_protocol_accepted" if status == "success" else "failed"
-                    if method not in ("read_device", "write_device", "register_preflight"):
-                        stage = "executed" if status == "success" else "failed"
+                    stage = "failed"
+                    if status == "success" and method == "write_device":
+                        verification = result.get("verification", {}) if isinstance(result, dict) else {}
+                        stage = (
+                            "field_execution_verified"
+                            if verification.get("status") == "verified"
+                            else "field_protocol_accepted"
+                        )
+                    elif status == "success" and method == "update_firmware":
+                        stage = "ota_initiated"
+                    elif status == "success" and method in STATE_CHANGING_COMMANDS:
+                        stage = "gateway_action_completed"
+                    elif status == "success":
+                        stage = "diagnostic_completed"
                     if method in STATE_CHANGING_COMMANDS:
                         self._governance.mark_terminal(
                             payload,

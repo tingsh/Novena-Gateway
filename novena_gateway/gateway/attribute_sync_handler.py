@@ -41,6 +41,10 @@ from typing import Optional
 
 from novena_gateway.__version__ import __version__
 from novena_gateway.gateway.redaction import redact_secrets
+from novena_gateway.gateway.remote_control_protocol import (
+    REMOTE_CONTROL_PROTOCOL_VERSION,
+    remote_control_capabilities,
+)
 
 log = logging.getLogger("novena_gateway.attribute_sync")
 
@@ -135,6 +139,12 @@ class AttributeSyncHandler:
         except Exception:
             pass
 
+        local_writeback_enabled = bool(
+            getattr(self._gateway, "_config", {})
+            .get("features", {})
+            .get("rpc", {})
+            .get("local_writeback_enabled", False)
+        )
         attrs = {
             "firmware_version": __version__,
             "ip_address": ip_address,
@@ -145,13 +155,11 @@ class AttributeSyncHandler:
             "active_connectors": active_connectors,
             "device_count": len(connected_devices),
             "status": status,
-            "remote_control_protocol_version": 1,
-            "remote_control_local_writeback_enabled": bool(
-                getattr(self._gateway, "_config", {})
-                .get("features", {})
-                .get("rpc", {})
-                .get("local_writeback_enabled", False)
+            "remote_control_protocol_version": REMOTE_CONTROL_PROTOCOL_VERSION,
+            "remote_control_capabilities": remote_control_capabilities(
+                local_writeback_enabled=local_writeback_enabled
             ),
+            "remote_control_local_writeback_enabled": local_writeback_enabled,
             "remote_control_policy_loaded": False,
         }
         rpc_handler = getattr(self._gateway, "_rpc_handler", None)

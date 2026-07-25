@@ -6,6 +6,10 @@ For commissioned control, an installer must enable the physical/site-authorized 
 
 The Gateway independently validates signature, target serial/device ID, schema, expiry, epoch, sequence, template/commissioning/policy revisions, policy checksum, exact connector mapping, type, units, range/enum, local authority and supervisory prerequisites. It writes `executing` durably before the connector call. A restart with that state is an uncertain outcome and must never repeat the command.
 
+Protocol version 1 advertises explicit `governed_commands_v1`, `lifecycle_stages_v1`, and `idempotent_replay_v1` capabilities. `local_writeback_v1` is advertised only when local write-back is enabled. A governed envelope must include the signed request ID, command ID, idempotency key, canonical Gateway serial, and matching canonical device ID/command key for a field write.
+
+Responses preserve lifecycle meaning: `gateway_received`, `executing`, `field_protocol_accepted`, and `field_execution_verified` are distinct. Firmware work reports `ota_initiated` after the verified artifact launches the upgrade process; it does not claim execution verification.
+
 Key compromise: add the affected ID to `revoked_command_key_ids`, deploy the revocation, emergency-disable control, increment the Hub epoch, install the replacement public key/policy and require acknowledgement before reactivation.
 
 Back up policy, journal and reconciliation spool evidence. A restored policy whose epoch is below the journal epoch anchor is rejected. Journal/storage health failures block write readiness. Logs and outbound errors must use existing secret/payload redaction.

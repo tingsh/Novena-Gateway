@@ -226,6 +226,9 @@ class GovernedCommandGuard:
         self._verify_signed({"payload": body, "signature": signature, "signing_key_id": key_id})
         if envelope.get("schema_version") != 1:
             raise GovernedCommandRejected("Unsupported governed-command schema")
+        for identity_field in ("request_id", "command_id", "idempotency_key"):
+            if not isinstance(envelope.get(identity_field), str) or not envelope[identity_field].strip():
+                raise GovernedCommandRejected(f"Missing canonical {identity_field}")
         target = envelope.get("target") or {}
         if target.get("gateway_serial") != self._serial_number:
             raise GovernedCommandRejected("Command targets a different Gateway")
@@ -245,6 +248,8 @@ class GovernedCommandGuard:
         params = envelope.get("params") or {}
         device_id = target.get("device_id")
         command_key = params.get("command_key")
+        if not device_id or str(params.get("device_id")) != str(device_id) or not command_key:
+            raise GovernedCommandRejected("Canonical device identity and command key are required")
         control = self._policy.get("controls", {}).get(f"{device_id}:{command_key}")
         if not control:
             raise GovernedCommandRejected("Device key is not enabled by retained policy")
