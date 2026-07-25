@@ -60,10 +60,10 @@ from novena_gateway.gateway.ota_security import (
 )
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 from novena_gateway.gateway.redaction import redact_secrets
+from novena_gateway.gateway.remote_control_protocol import REMOTE_CONTROL_PROTOCOL_VERSION
 
 log = logging.getLogger("novena_gateway.rpc_handler")
 
-REMOTE_CONTROL_PROTOCOL_VERSION = 1
 STATE_CHANGING_COMMANDS = {
     "set_log_level",
     "restart_connector",
@@ -131,6 +131,19 @@ class RpcHandler:
             f"v1/gateway/{self._serial_number}/control/policy",
             self._on_control_policy,
         )
+        reconciliation = self._governance.journal.reconciliation_events()
+        if reconciliation:
+            self._publisher.publish_attributes(
+                {
+                    "serial_number": self._serial_number,
+                    "ts": int(time() * 1000),
+                    "attributes": {
+                        "remote_control_reconciliation": reconciliation[-500:],
+                        **self._governance.readiness(),
+                    },
+                },
+                immediate=True,
+            )
         log.info("RPC handler started, listening on: %s", self._inbound_topic)
 
     def stop(self):
@@ -145,6 +158,18 @@ class RpcHandler:
                 self._governance.policy_revision,
                 self._governance.control_epoch,
             )
+            self._publisher.publish_attributes(
+                {
+                    "serial_number": self._serial_number,
+                    "ts": int(time() * 1000),
+                    "attributes": {
+                        **self._governance.readiness(),
+                        "remote_control_policy_ack_revision": self._governance.policy_revision,
+                        "remote_control_policy_ack_epoch": self._governance.control_epoch,
+                    },
+                },
+                immediate=True,
+            )
         except GovernedCommandRejected as exc:
             log.warning("Rejected governed-control policy: %s", exc)
 
@@ -153,11 +178,15 @@ class RpcHandler:
         if not isinstance(payload, dict):
             log.warning("Rejected malformed RPC payload: expected an object")
             return
-        request_id = payload.get("request_id", "unknown")
+        request_id = payload.get("request_id")
         method = payload.get("method", "")
         params = payload.get("params", {})
 
         log.info("RPC request received: method=%s, request_id=%s", method, request_id)
+
+        if not isinstance(request_id, str) or not request_id.strip():
+            log.warning("Rejected RPC payload without request_id")
+            return
 
         handler = self._commands.get(method)
         if not handler:
@@ -201,12 +230,30 @@ class RpcHandler:
                     stage="rejected",
                 )
                 return
-            if method == "write_device" and not params.get("device_id"):
+            target = payload.get("target")
+            if (
+                not payload.get("idempotency_key")
+                or not isinstance(target, dict)
+                or target.get("gateway_serial") != self._serial_number
+            ):
                 self._send_response(
                     request_id,
                     method,
                     status="error",
-                    error="Governed device writes require canonical device_id",
+                    error="Governed commands require canonical command and Gateway identity",
+                    stage="rejected",
+                )
+                return
+            if method == "write_device" and (
+                not params.get("device_id")
+                or not params.get("command_key")
+                or str(target.get("device_id")) != str(params.get("device_id"))
+            ):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed device writes require one canonical device_id and command_key",
                     stage="rejected",
                 )
                 return
@@ -249,6 +296,12 @@ class RpcHandler:
                     if method in STATE_CHANGING_COMMANDS:
                         self._governance.enforce_prerequisites(governed_control, params)
                         self._governance.mark_executing(payload)
+                        self._send_response(
+                            request_id,
+                            method,
+                            status="processing",
+                            stage="executing",
+                        )
                     result = handler(params)
                     status = "success"
                     error = None
@@ -256,9 +309,52 @@ class RpcHandler:
                         if result.get("error") or result.get("device_accepted") is False:
                             status = "error"
                             error = result.get("error") or "Device command was not accepted"
-                    stage = "field_protocol_accepted" if status == "success" else "failed"
-                    if method not in ("read_device", "write_device", "register_preflight"):
-                        stage = "executed" if status == "success" else "failed"
+                    if method == "write_device" and status == "success":
+                        readback = governed_control.get("readback") or {}
+                        if readback.get("required"):
+                            read_result = self._cmd_read_device(
+                                {
+                                    "device_name": params["device_name"],
+                                    "functionCode": int(readback.get("functionCode", 3)),
+                                    "address": int(readback.get("address", params["address"])),
+                                    "objectsCount": int(readback.get("objectsCount", 1)),
+                                    "type": readback.get("type", params.get("type")),
+                                }
+                            )
+                            actual = read_result.get("read_value")
+                            tolerance = float(readback.get("tolerance", 0))
+                            expected = float(params["expected_value"])
+                            if actual is None or abs(float(actual) - expected) > tolerance:
+                                status = "error"
+                                error = "Post-write verification mismatch"
+                                result["verification"] = {
+                                    "status": "mismatch",
+                                    "expected": expected,
+                                    "actual": actual,
+                                    "tolerance": tolerance,
+                                    "critical": governed_control.get("risk") == "critical",
+                                }
+                            else:
+                                result["verification"] = {
+                                    "status": "verified",
+                                    "expected": expected,
+                                    "actual": actual,
+                                    "tolerance": tolerance,
+                                }
+                    stage = "failed"
+                    if status == "success" and method == "write_device":
+                        verification = result.get("verification", {}) if isinstance(result, dict) else {}
+                        stage = (
+                            "field_execution_verified"
+                            if verification.get("status") == "verified"
+                            else "field_protocol_accepted"
+                        )
+                    elif status == "success" and method == "update_firmware":
+                        stage = "ota_initiated"
+                    elif status == "success" and method in STATE_CHANGING_COMMANDS:
+                        stage = "gateway_action_completed"
+                    elif status == "success":
+                        stage = "diagnostic_completed"
                     if method in STATE_CHANGING_COMMANDS:
                         self._governance.mark_terminal(
                             payload,

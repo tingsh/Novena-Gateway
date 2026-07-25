@@ -38,9 +38,15 @@ class DurableCommandJournal:
         try:
             with open(self._path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-                return data if isinstance(data, dict) else {"commands": {}, "sequences": {}}
+                if isinstance(data, dict):
+                    data.setdefault("commands", {})
+                    data.setdefault("sequences", {})
+                    data.setdefault("events", [])
+                    data.setdefault("max_epoch", 0)
+                    return data
+                return {"commands": {}, "sequences": {}, "events": [], "max_epoch": 0}
         except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {"commands": {}, "sequences": {}}
+            return {"commands": {}, "sequences": {}, "events": [], "max_epoch": 0}
 
     def _persist(self):
         directory = os.path.dirname(self._path)
@@ -64,6 +70,19 @@ class DurableCommandJournal:
         with self._lock:
             return int(self._state["sequences"].get(device_id, 0))
 
+    def max_epoch(self):
+        with self._lock:
+            return int(self._state.get("max_epoch", 0))
+
+    def record_epoch(self, epoch):
+        with self._lock:
+            self._state["max_epoch"] = max(int(epoch), int(self._state.get("max_epoch", 0)))
+            self._persist()
+
+    def reconciliation_events(self):
+        with self._lock:
+            return list(self._state.get("events", []))
+
     def write(self, command_id, record):
         with self._lock:
             self._state["commands"][command_id] = dict(record)
@@ -74,6 +93,19 @@ class DurableCommandJournal:
                     sequence,
                     int(self._state["sequences"].get(device_id, 0)),
                 )
+            self._state["events"].append(
+                {
+                    "command_id": command_id,
+                    "state": record.get("state"),
+                    "status": record.get("status"),
+                    "stage": record.get("stage"),
+                    "error": record.get("error"),
+                    "device_id": device_id,
+                    "sequence_number": sequence,
+                    "recorded_at": int(time() * 1000),
+                }
+            )
+            self._state["events"] = self._state["events"][-10000:]
             self._persist()
 
 
@@ -84,7 +116,10 @@ class GovernedCommandGuard:
         self._trusted_clock = bool(config.get("trusted_clock", False))
         self._max_clock_offset = float(config.get("max_clock_offset_seconds", 5))
         self._keys = {}
+        revoked = set(config.get("revoked_command_key_ids") or [])
         for key_id, encoded in (config.get("trusted_command_keys") or {}).items():
+            if key_id in revoked:
+                continue
             try:
                 self._keys[key_id] = Ed25519PublicKey.from_public_bytes(base64.b64decode(encoded, validate=True))
             except (ValueError, TypeError):
@@ -117,6 +152,8 @@ class GovernedCommandGuard:
             "remote_control_epoch": self.control_epoch,
             "remote_control_clock_ready": self._trusted_clock,
             "remote_control_journal_ready": os.path.isdir(os.path.dirname(self.journal._path)),
+            "remote_control_event_spool_count": len(self.journal.reconciliation_events()),
+            "remote_control_storage_healthy": os.access(os.path.dirname(self.journal._path), os.W_OK),
         }
 
     def _load_policy(self):
@@ -153,7 +190,8 @@ class GovernedCommandGuard:
             raise GovernedCommandRejected("Unsupported policy schema")
         if payload.get("gateway_serial") != self._serial_number:
             raise GovernedCommandRejected("Policy targets a different Gateway")
-        if self._policy and int(payload.get("control_epoch", 0)) < self.control_epoch:
+        incoming_epoch = int(payload.get("control_epoch", 0))
+        if incoming_epoch < self.journal.max_epoch():
             raise GovernedCommandRejected("Restored or stale policy epoch")
         os.makedirs(os.path.dirname(self._policy_path), exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -169,6 +207,7 @@ class GovernedCommandGuard:
             temp_path = handle.name
         os.replace(temp_path, self._policy_path)
         self._policy = payload
+        self.journal.record_epoch(incoming_epoch)
 
     def _parse_time(self, value):
         try:
@@ -187,6 +226,9 @@ class GovernedCommandGuard:
         self._verify_signed({"payload": body, "signature": signature, "signing_key_id": key_id})
         if envelope.get("schema_version") != 1:
             raise GovernedCommandRejected("Unsupported governed-command schema")
+        for identity_field in ("request_id", "command_id", "idempotency_key"):
+            if not isinstance(envelope.get(identity_field), str) or not envelope[identity_field].strip():
+                raise GovernedCommandRejected(f"Missing canonical {identity_field}")
         target = envelope.get("target") or {}
         if target.get("gateway_serial") != self._serial_number:
             raise GovernedCommandRejected("Command targets a different Gateway")
@@ -206,6 +248,8 @@ class GovernedCommandGuard:
         params = envelope.get("params") or {}
         device_id = target.get("device_id")
         command_key = params.get("command_key")
+        if not device_id or str(params.get("device_id")) != str(device_id) or not command_key:
+            raise GovernedCommandRejected("Canonical device identity and command key are required")
         control = self._policy.get("controls", {}).get(f"{device_id}:{command_key}")
         if not control:
             raise GovernedCommandRejected("Device key is not enabled by retained policy")

@@ -96,6 +96,7 @@ class GovernedCommandGuardTest(unittest.TestCase):
         now = datetime.now(timezone.utc)
         body = {
             "schema_version": 1,
+            "request_id": "request-1",
             "command_id": "command-1",
             "idempotency_key": "idempotency-1",
             "target": {"gateway_serial": "GW-001", "device_id": "device-1"},
@@ -179,3 +180,23 @@ class GovernedCommandGuardTest(unittest.TestCase):
         wire["payload"]["control_epoch"] = 99
         with self.assertRaises(GovernedCommandRejected):
             self.guard.install_policy("policy", wire)
+
+    def test_revoked_key_is_rejected_even_if_public_key_remains_configured(self):
+        revoked_config = dict(self.config)
+        revoked_config["revoked_command_key_ids"] = ["key-1"]
+        revoked_config["command_policy_path"] = os.path.join(self.tempdir.name, "revoked-policy.json")
+        guard = GovernedCommandGuard(
+            serial_number="GW-001",
+            gateway=FakeGateway(),
+            config=revoked_config,
+        )
+        with self.assertRaisesRegex(GovernedCommandRejected, "not trusted"):
+            guard.install_policy("policy", self._signed_policy(self.policy_payload))
+
+    def test_epoch_anchor_rejects_policy_rollback(self):
+        higher = copy.deepcopy(self.policy_payload)
+        higher["revision"] = 5
+        higher["control_epoch"] = 8
+        self.guard.install_policy("policy", self._signed_policy(higher))
+        with self.assertRaisesRegex(GovernedCommandRejected, "stale policy epoch"):
+            self.guard.install_policy("policy", self._signed_policy(self.policy_payload))
