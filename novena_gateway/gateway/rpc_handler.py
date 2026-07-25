@@ -131,6 +131,19 @@ class RpcHandler:
             f"v1/gateway/{self._serial_number}/control/policy",
             self._on_control_policy,
         )
+        reconciliation = self._governance.journal.reconciliation_events()
+        if reconciliation:
+            self._publisher.publish_attributes(
+                {
+                    "serial_number": self._serial_number,
+                    "ts": int(time() * 1000),
+                    "attributes": {
+                        "remote_control_reconciliation": reconciliation[-500:],
+                        **self._governance.readiness(),
+                    },
+                },
+                immediate=True,
+            )
         log.info("RPC handler started, listening on: %s", self._inbound_topic)
 
     def stop(self):
