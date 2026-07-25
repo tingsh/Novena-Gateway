@@ -161,6 +161,9 @@ class AttributeSyncHandler:
             ),
             "remote_control_local_writeback_enabled": local_writeback_enabled,
             "remote_control_policy_loaded": False,
+            "gateway_capabilities": list(
+                getattr(getattr(self._gateway, "_remote_config", None), "capabilities", [])
+            ),
         }
         rpc_handler = getattr(self._gateway, "_rpc_handler", None)
         if rpc_handler and getattr(rpc_handler, "_governance", None):

@@ -546,6 +546,22 @@ class TestRpcHandler(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["result"]["operation"], "read")
 
+    def test_guided_discovery_starts_asynchronously_and_can_be_cancelled(self):
+        discovery = MagicMock()
+        self.mock_gateway._discovery_service = discovery
+
+        started = self.handler._cmd_deployment_discover(
+            {"tcp_hosts": ["192.168.1.50:502"]}
+        )
+        cancelled = self.handler._cmd_deployment_discover({"cancel": True})
+
+        discovery.start_guided_scan.assert_called_once_with(
+            {"tcp_hosts": ["192.168.1.50:502"]}
+        )
+        discovery.cancel_current_scan.assert_called_once()
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(cancelled["status"], "cancelled")
+
     def test_update_firmware(self):
         """update_firmware should verify a signed manifest before running the upgrade."""
         from unittest.mock import patch

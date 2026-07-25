@@ -72,7 +72,8 @@
     "remote_config": {
       "enabled": true,
       "backup_dir": "/var/lib/novena-gateway/config_backups",
-      "last_known_good_path": "/var/lib/novena-gateway/last_known_good_config.json"
+      "last_known_good_path": "/var/lib/novena-gateway/last_known_good_config.json",
+      "config_journal_path": "/var/lib/novena-gateway/deployment_setup/config_journal.json"
     },
     "rpc": {
       "enabled": true
@@ -83,7 +84,7 @@
       "scan_interval_seconds": 3600,
       "rtu_slave_range": [1, 32],
       "rtu_baud_rates": [9600, 19200],
-      "tcp_subnet_scan": true,
+      "tcp_subnet_scan": false,
       "tcp_hosts": [],
       "tcp_ports": [502],
       "tcp_scan_timeout_ms": 500

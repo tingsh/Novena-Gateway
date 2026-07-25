@@ -107,12 +107,26 @@ class NovenaGateway:
         )
 
         # Remote config handler
+        remote_config_cfg = dict(feature_cfg.get("remote_config", {}))
+        rpc_security_cfg = feature_cfg.get("rpc", {})
+        remote_config_cfg.setdefault(
+            "trusted_config_keys",
+            rpc_security_cfg.get("trusted_command_keys", {}),
+        )
+        remote_config_cfg.setdefault(
+            "revoked_config_key_ids",
+            rpc_security_cfg.get("revoked_command_key_ids", []),
+        )
+        remote_config_cfg.setdefault(
+            "trusted_clock",
+            rpc_security_cfg.get("trusted_clock", False),
+        )
         self._remote_config = RemoteConfigHandler(
             gateway=self,
             publisher=self._mqtt_publisher,
             serial_number=self._serial_number,
             config_path=config_path,
-            config=feature_cfg.get("remote_config", {}),
+            config=remote_config_cfg,
         )
 
         # RPC handler

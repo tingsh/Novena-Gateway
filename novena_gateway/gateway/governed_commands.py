@@ -286,6 +286,46 @@ class GovernedCommandGuard:
             raise GovernedCommandRejected("Command sequence is stale or duplicated")
         return control, None
 
+    def validate_diagnostic(self, envelope):
+        """Verify a signed, gateway-scoped diagnostic without control policy."""
+        if not self._trusted_clock:
+            raise GovernedCommandRejected("Trusted clock is not ready")
+        signature = envelope.get("signature")
+        key_id = envelope.get("signing_key_id")
+        body = {
+            key: value
+            for key, value in envelope.items()
+            if key not in {"signature", "signing_key_id"}
+        }
+        self._verify_signed(
+            {
+                "payload": body,
+                "signature": signature,
+                "signing_key_id": key_id,
+            }
+        )
+        if envelope.get("schema_version") != 1:
+            raise GovernedCommandRejected("Unsupported diagnostic command schema")
+        for identity_field in ("request_id", "command_id", "idempotency_key"):
+            if not isinstance(envelope.get(identity_field), str) or not envelope[identity_field].strip():
+                raise GovernedCommandRejected(f"Missing canonical {identity_field}")
+        if (envelope.get("target") or {}).get("gateway_serial") != self._serial_number:
+            raise GovernedCommandRejected("Diagnostic command targets a different Gateway")
+        if envelope.get("method") not in {
+            "deployment_preflight",
+            "deployment_discover",
+            "deployment_validate",
+        }:
+            raise GovernedCommandRejected("Unsupported signed diagnostic operation")
+        now = datetime.now(timezone.utc)
+        issued_at = self._parse_time(envelope.get("issued_at"))
+        expires_at = self._parse_time(envelope.get("expires_at"))
+        if expires_at <= now:
+            raise GovernedCommandRejected("Diagnostic command has expired")
+        if issued_at > now:
+            raise GovernedCommandRejected("Diagnostic command was issued in the future")
+        return body
+
     def device_lock(self, device_id):
         with self._locks_guard:
             return self._device_locks.setdefault(device_id, threading.Lock())

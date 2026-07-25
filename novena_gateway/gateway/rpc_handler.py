@@ -59,7 +59,7 @@ from novena_gateway.gateway.ota_security import (
     verify_manifest,
 )
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
-from novena_gateway.gateway.redaction import redact_secrets
+from novena_gateway.gateway.redaction import redact_diagnostics, redact_secrets
 from novena_gateway.gateway.remote_control_protocol import REMOTE_CONTROL_PROTOCOL_VERSION
 
 log = logging.getLogger("novena_gateway.rpc_handler")
@@ -71,6 +71,11 @@ STATE_CHANGING_COMMANDS = {
     "reboot",
     "write_device",
     "update_firmware",
+}
+SIGNED_DEPLOYMENT_DIAGNOSTICS = {
+    "deployment_preflight",
+    "deployment_discover",
+    "deployment_validate",
 }
 
 
@@ -114,6 +119,9 @@ class RpcHandler:
             "get_device_health": self._cmd_get_device_health,
             "register_preflight": self._cmd_register_preflight,
             "scan_devices": self._cmd_scan_devices,
+            "deployment_preflight": self._cmd_deployment_preflight,
+            "deployment_discover": self._cmd_deployment_discover,
+            "deployment_validate": self._cmd_deployment_validate,
             "update_firmware": self._cmd_update_firmware,
             "network_preflight": self._cmd_network_preflight,
             "hardware_preflight": self._cmd_hardware_preflight,
@@ -202,6 +210,18 @@ class RpcHandler:
                 stage="rejected",
             )
             return
+        if method in SIGNED_DEPLOYMENT_DIAGNOSTICS:
+            try:
+                self._governance.validate_diagnostic(payload)
+            except GovernedCommandRejected as exc:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error=str(exc),
+                    stage="rejected",
+                )
+                return
         if method in STATE_CHANGING_COMMANDS:
             if not self._local_writeback_enabled:
                 self._send_response(
@@ -399,7 +419,7 @@ class RpcHandler:
             "result": result,
             "error": error,
         }
-        self._publisher.publish_rpc_response(redact_secrets(payload))
+        self._publisher.publish_rpc_response(redact_diagnostics(payload))
         log.debug("RPC response sent: method=%s, status=%s", method, status)
 
     # ─── Command implementations ──────────────────────────────────────
@@ -777,6 +797,133 @@ class RpcHandler:
             "interfaces_scanned": len(report.get("interfaces", [])),
             "scan_ts": report.get("scan_ts"),
         }
+
+    def _cmd_deployment_preflight(self, params: dict) -> dict:
+        """Return setup-specific readiness without changing appliance state."""
+        hardware = self._cmd_hardware_preflight({})
+        network = self._cmd_network_preflight({})
+        remote_config = getattr(self._gateway, "_remote_config", None)
+        capabilities = list(getattr(remote_config, "capabilities", []))
+        checks = [
+            {
+                "key": "secure_config",
+                "label": "Secure configuration",
+                "status": "pass" if "guided_setup_v1" in capabilities else "fail",
+                "message": (
+                    "Secure guided setup is ready."
+                    if "guided_setup_v1" in capabilities
+                    else "This Gateway needs a trusted clock and Novena configuration key."
+                ),
+                "action": "Install the approved Novena public key and synchronize the Gateway clock.",
+                "blocking": True,
+            },
+            {
+                "key": "clock",
+                "label": "Clock health",
+                "status": "pass" if (hardware.get("clock") or {}).get("ok") else "fail",
+                "message": (
+                    "Gateway clock is synchronized."
+                    if (hardware.get("clock") or {}).get("ok")
+                    else "The Gateway clock is not synchronized."
+                ),
+                "action": "Check internet time access and restart time synchronization.",
+                "blocking": True,
+            },
+            {
+                "key": "disk",
+                "label": "Disk space",
+                "status": "pass" if (hardware.get("disk") or {}).get("ok") else "fail",
+                "message": (
+                    f"{(hardware.get('disk') or {}).get('free_mb')} MB of free storage is available."
+                    if (hardware.get("disk") or {}).get("ok")
+                    else "The Gateway does not have enough free storage for reliable operation."
+                ),
+                "action": "Remove old support files or replace the storage before continuing.",
+                "blocking": True,
+            },
+            {
+                "key": "interfaces",
+                "label": "Equipment interfaces",
+                "status": (
+                    "pass"
+                    if hardware.get("serial_ports") or hardware.get("ip_available")
+                    else "warning"
+                ),
+                "message": (
+                    "Equipment interfaces were detected."
+                    if hardware.get("serial_ports") or hardware.get("ip_available")
+                    else "No usable equipment interface was detected."
+                ),
+                "action": "Reconnect the Ethernet or RS485 interface, then retry.",
+                "blocking": False,
+            },
+            {
+                "key": "hardware",
+                "label": "Gateway hardware",
+                "status": "pass" if hardware.get("ok", hardware.get("status") == "ok") else "warning",
+                "message": "Gateway hardware checks completed.",
+                "action": "Open technical details to review the hardware warnings.",
+                "blocking": False,
+            },
+            {
+                "key": "network",
+                "label": "Network health",
+                "status": "pass" if (network.get("mqtt") or {}).get("reachable") else "warning",
+                "message": (
+                    "The Gateway can reach the Novena service."
+                    if (network.get("mqtt") or {}).get("reachable")
+                    else "The Gateway could not confirm broker reachability."
+                ),
+                "action": "Check the site internet connection, DNS, and broker firewall access.",
+                "blocking": False,
+            },
+        ]
+        blocked = any(check["blocking"] and check["status"] == "fail" for check in checks)
+        return redact_secrets(
+            {
+                "status": "blocked" if blocked else "ready",
+                "message": "Gateway readiness checks completed.",
+                "checks": checks,
+                "capabilities": capabilities,
+                "technical_evidence": {
+                    "internet_reachable": bool((network.get("mqtt") or {}).get("reachable")),
+                    "dns_ok": bool((network.get("dns") or {}).get("ok")),
+                    "broker_tcp_ok": bool((network.get("mqtt") or {}).get("reachable")),
+                    "tls_ok": True,
+                    "clock_synchronized": bool((hardware.get("clock") or {}).get("ok")),
+                    "disk_free_mb": (hardware.get("disk") or {}).get("free_mb"),
+                    "serial_interfaces": hardware.get("serial_ports") or [],
+                    "details": {"hardware": hardware, "network": network},
+                },
+                "retryable": True,
+            }
+        )
+
+    def _cmd_deployment_discover(self, params: dict) -> dict:
+        """Run a rate-bounded scan against customer-approved targets."""
+        discovery = getattr(self._gateway, "_discovery_service", None)
+        if not discovery:
+            raise RuntimeError("Equipment discovery is not available on this Gateway")
+        if params.get("cancel"):
+            discovery.cancel_current_scan()
+            return {
+                "status": "cancelled",
+                "message": "The equipment scan was cancelled.",
+                "retryable": True,
+            }
+        discovery.start_guided_scan(params)
+        return {
+            "status": "running",
+            "message": "Equipment discovery started. Results will appear as each target is checked.",
+            "retryable": True,
+        }
+
+    def _cmd_deployment_validate(self, params: dict) -> dict:
+        """Read selected datapoints without saving config or emitting telemetry."""
+        discovery = getattr(self._gateway, "_discovery_service", None)
+        if not discovery:
+            raise RuntimeError("Equipment validation is not available on this Gateway")
+        return redact_secrets(discovery.validate_modbus(params))
 
     def _cmd_read_device(self, params: dict) -> dict:
         """

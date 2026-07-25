@@ -48,7 +48,8 @@
     "remote_config": {
       "enabled": true,
       "backup_dir": "config_backups",
-      "last_known_good_path": "last_known_good_config.json"
+      "last_known_good_path": "last_known_good_config.json",
+      "config_journal_path": "storage/deployment_setup/config_journal.json"
     },
     "rpc": {
       "enabled": true,
