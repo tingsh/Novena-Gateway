@@ -359,7 +359,10 @@ class AsyncModbusConnector(Connector, Thread):
 
         if slave.master.connected():
             device_connected = self.__gateway.add_device(slave.device_name,
-                                                         {CONNECTOR_PARAMETER: self},
+                                                         {
+                                                             CONNECTOR_PARAMETER: self,
+                                                             "device_id": slave.uplink_converter_config.device_id,
+                                                         },
                                                          device_type=slave.device_type)
 
             slave.last_connect_time = monotonic() if device_connected else 0

@@ -37,6 +37,7 @@ Outbound RPC Response (edge → cloud):
 }
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -45,6 +46,10 @@ import hashlib
 from time import time, monotonic
 from typing import Optional
 from novena_gateway.gateway.hardware_preflight import run_preflight
+from novena_gateway.gateway.governed_commands import (
+    GovernedCommandGuard,
+    GovernedCommandRejected,
+)
 from novena_gateway.gateway.ota_security import (
     DEFAULT_OTA_PUBLIC_KEY_PATH,
     OtaSecurityError,
@@ -55,8 +60,18 @@ from novena_gateway.gateway.ota_security import (
 )
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 from novena_gateway.gateway.redaction import redact_secrets
+from novena_gateway.gateway.remote_control_protocol import REMOTE_CONTROL_PROTOCOL_VERSION
 
 log = logging.getLogger("novena_gateway.rpc_handler")
+
+STATE_CHANGING_COMMANDS = {
+    "set_log_level",
+    "restart_connector",
+    "restart_all",
+    "reboot",
+    "write_device",
+    "update_firmware",
+}
 
 
 class RpcHandler:
@@ -71,9 +86,17 @@ class RpcHandler:
         self._handler_config = config or {}
 
         self._enabled = self._handler_config.get("enabled", True)
+        self._local_writeback_enabled = bool(
+            self._handler_config.get("local_writeback_enabled", False)
+        )
         self._inbound_topic = f"v1/gateway/{self._serial_number}/rpc/request"
         self._start_time = monotonic()
         self._helper = PrivilegedCommandRunner(self._handler_config.get("helper_path"))
+        self._governance = GovernedCommandGuard(
+            serial_number=serial_number,
+            gateway=gateway,
+            config=self._handler_config,
+        )
 
         # Command dispatch table
         self._commands = {
@@ -104,48 +127,267 @@ class RpcHandler:
             return
 
         self._publisher.subscribe(self._inbound_topic, self._on_rpc_request)
+        self._publisher.subscribe(
+            f"v1/gateway/{self._serial_number}/control/policy",
+            self._on_control_policy,
+        )
+        reconciliation = self._governance.journal.reconciliation_events()
+        if reconciliation:
+            self._publisher.publish_attributes(
+                {
+                    "serial_number": self._serial_number,
+                    "ts": int(time() * 1000),
+                    "attributes": {
+                        "remote_control_reconciliation": reconciliation[-500:],
+                        **self._governance.readiness(),
+                    },
+                },
+                immediate=True,
+            )
         log.info("RPC handler started, listening on: %s", self._inbound_topic)
 
     def stop(self):
         """No persistent resources to clean up."""
         pass
 
+    def _on_control_policy(self, topic, payload):
+        try:
+            self._governance.install_policy(topic, payload)
+            log.info(
+                "Installed governed-control policy revision %s at epoch %s",
+                self._governance.policy_revision,
+                self._governance.control_epoch,
+            )
+            self._publisher.publish_attributes(
+                {
+                    "serial_number": self._serial_number,
+                    "ts": int(time() * 1000),
+                    "attributes": {
+                        **self._governance.readiness(),
+                        "remote_control_policy_ack_revision": self._governance.policy_revision,
+                        "remote_control_policy_ack_epoch": self._governance.control_epoch,
+                    },
+                },
+                immediate=True,
+            )
+        except GovernedCommandRejected as exc:
+            log.warning("Rejected governed-control policy: %s", exc)
+
     def _on_rpc_request(self, topic: str, payload: dict):
         """Handle an inbound RPC request."""
-        request_id = payload.get("request_id", "unknown")
+        if not isinstance(payload, dict):
+            log.warning("Rejected malformed RPC payload: expected an object")
+            return
+        request_id = payload.get("request_id")
         method = payload.get("method", "")
         params = payload.get("params", {})
 
         log.info("RPC request received: method=%s, request_id=%s", method, request_id)
 
+        if not isinstance(request_id, str) or not request_id.strip():
+            log.warning("Rejected RPC payload without request_id")
+            return
+
         handler = self._commands.get(method)
         if not handler:
             self._send_response(request_id, method, status="error",
-                                error=f"Unknown RPC method: {method}")
+                                error=f"Unknown RPC method: {method}", stage="rejected")
             return
+        if not isinstance(params, dict):
+            self._send_response(
+                request_id,
+                method,
+                status="error",
+                error="RPC params must be an object",
+                stage="rejected",
+            )
+            return
+        if method in STATE_CHANGING_COMMANDS:
+            if not self._local_writeback_enabled:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Local write-back is disabled on this Gateway",
+                    stage="rejected",
+                )
+                return
+            if payload.get("schema_version") != REMOTE_CONTROL_PROTOCOL_VERSION:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Unsupported or missing governed-command schema version",
+                    stage="rejected",
+                )
+                return
+            if not payload.get("command_id"):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed state-changing commands require command_id",
+                    stage="rejected",
+                )
+                return
+            target = payload.get("target")
+            if (
+                not payload.get("idempotency_key")
+                or not isinstance(target, dict)
+                or target.get("gateway_serial") != self._serial_number
+            ):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed commands require canonical command and Gateway identity",
+                    stage="rejected",
+                )
+                return
+            if method == "write_device" and (
+                not params.get("device_id")
+                or not params.get("command_key")
+                or str(target.get("device_id")) != str(params.get("device_id"))
+            ):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed device writes require one canonical device_id and command_key",
+                    stage="rejected",
+                )
+                return
+            try:
+                governed_control, replay = self._governance.validate(payload)
+            except GovernedCommandRejected as exc:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error=str(exc),
+                    stage="rejected",
+                )
+                return
+            if replay:
+                self._send_response(
+                    request_id,
+                    method,
+                    status=replay["status"],
+                    result=replay.get("result"),
+                    error=replay.get("error"),
+                    stage=replay.get("stage") or "replayed_terminal_result",
+                )
+                return
+        else:
+            governed_control = None
+
+        self._send_response(request_id, method, status="received", stage="gateway_received")
 
         import threading
 
         def execute():
+            lock = (
+                self._governance.device_lock(payload["target"]["device_id"])
+                if method in STATE_CHANGING_COMMANDS
+                else contextlib.nullcontext()
+            )
             try:
-                result = handler(params)
-                status = "success"
-                error = None
-                if method in ("read_device", "write_device", "register_preflight") and isinstance(result, dict):
-                    if result.get("error") or result.get("device_accepted") is False:
-                        status = "error"
-                        error = result.get("error") or "Device command was not accepted"
-                self._send_response(request_id, method, status=status, result=result, error=error)
+                with lock:
+                    if method in STATE_CHANGING_COMMANDS:
+                        self._governance.enforce_prerequisites(governed_control, params)
+                        self._governance.mark_executing(payload)
+                        self._send_response(
+                            request_id,
+                            method,
+                            status="processing",
+                            stage="executing",
+                        )
+                    result = handler(params)
+                    status = "success"
+                    error = None
+                    if method in ("read_device", "write_device", "register_preflight") and isinstance(result, dict):
+                        if result.get("error") or result.get("device_accepted") is False:
+                            status = "error"
+                            error = result.get("error") or "Device command was not accepted"
+                    if method == "write_device" and status == "success":
+                        readback = governed_control.get("readback") or {}
+                        if readback.get("required"):
+                            read_result = self._cmd_read_device(
+                                {
+                                    "device_name": params["device_name"],
+                                    "functionCode": int(readback.get("functionCode", 3)),
+                                    "address": int(readback.get("address", params["address"])),
+                                    "objectsCount": int(readback.get("objectsCount", 1)),
+                                    "type": readback.get("type", params.get("type")),
+                                }
+                            )
+                            actual = read_result.get("read_value")
+                            tolerance = float(readback.get("tolerance", 0))
+                            expected = float(params["expected_value"])
+                            if actual is None or abs(float(actual) - expected) > tolerance:
+                                status = "error"
+                                error = "Post-write verification mismatch"
+                                result["verification"] = {
+                                    "status": "mismatch",
+                                    "expected": expected,
+                                    "actual": actual,
+                                    "tolerance": tolerance,
+                                    "critical": governed_control.get("risk") == "critical",
+                                }
+                            else:
+                                result["verification"] = {
+                                    "status": "verified",
+                                    "expected": expected,
+                                    "actual": actual,
+                                    "tolerance": tolerance,
+                                }
+                    stage = "failed"
+                    if status == "success" and method == "write_device":
+                        verification = result.get("verification", {}) if isinstance(result, dict) else {}
+                        stage = (
+                            "field_execution_verified"
+                            if verification.get("status") == "verified"
+                            else "field_protocol_accepted"
+                        )
+                    elif status == "success" and method == "update_firmware":
+                        stage = "ota_initiated"
+                    elif status == "success" and method in STATE_CHANGING_COMMANDS:
+                        stage = "gateway_action_completed"
+                    elif status == "success":
+                        stage = "diagnostic_completed"
+                    if method in STATE_CHANGING_COMMANDS:
+                        self._governance.mark_terminal(
+                            payload,
+                            status=status,
+                            result=result,
+                            error=error,
+                            stage=stage,
+                        )
+                    self._send_response(
+                        request_id,
+                        method,
+                        status=status,
+                        result=result,
+                        error=error,
+                        stage=stage,
+                    )
             except Exception as e:
                 log.exception("RPC command '%s' failed: %s", method, e)
-                self._send_response(request_id, method, status="error", error=str(e))
+                if method in STATE_CHANGING_COMMANDS:
+                    self._governance.mark_terminal(
+                        payload,
+                        status="error",
+                        error=str(e),
+                        stage="failed",
+                    )
+                self._send_response(request_id, method, status="error", error=str(e), stage="failed")
 
         thread = threading.Thread(target=execute, name=f"RPC-{method}-{request_id[:8]}")
         thread.daemon = True
         thread.start()
 
     def _send_response(self, request_id: str, method: str, status: str,
-                       result=None, error=None):
+                       result=None, error=None, stage=None):
         """Publish an RPC response to the cloud."""
         payload = {
             "serial_number": self._serial_number,
@@ -153,6 +395,7 @@ class RpcHandler:
             "method": method,
             "ts": int(time() * 1000),
             "status": status,
+            "stage": stage or status,
             "result": result,
             "error": error,
         }
@@ -341,6 +584,23 @@ class RpcHandler:
 
         return connector, device_info
 
+    def _resolve_canonical_device(self, device_id: str):
+        """Resolve an immutable commissioned identifier to the live connector entry."""
+        matches = [
+            (name, info)
+            for name, info in self._gateway.get_devices().items()
+            if str(info.get("device_id") or "") == str(device_id)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Canonical device_id '{device_id}' is not uniquely mapped in the gateway registry"
+            )
+        device_name, device_info = matches[0]
+        connector = device_info.get("connector")
+        if not connector:
+            raise ValueError(f"Device '{device_id}' has no connector reference")
+        return device_name, connector, device_info
+
     def _build_connector_rpc_content(self, device_name: str, method: str, params: dict) -> dict:
         """
         Build the content dict expected by connector.server_side_rpc_handler().
@@ -443,9 +703,13 @@ class RpcHandler:
             "timeout": 5.0           // optional: seconds
         }
         """
-        device_name = params.get("device_name")
-        if not device_name:
-            raise ValueError("Missing 'device_name' parameter")
+        device_id = params.get("device_id")
+        if not device_id:
+            raise ValueError("Missing 'device_id' parameter")
+        device_name, connector, _ = self._resolve_canonical_device(device_id)
+        requested_name = params.get("device_name")
+        if requested_name and requested_name != device_name:
+            raise ValueError("device_name does not match canonical device_id")
 
         function_code = params.get("functionCode")
         if function_code is None:
@@ -460,8 +724,6 @@ class RpcHandler:
             raise ValueError("Missing 'value' parameter")
         if params["value"] is None:
             raise ValueError("Invalid 'value' parameter: value cannot be null")
-
-        connector, _ = self._find_connector_for_device(device_name)
 
         # Build the RPC content in the format the connector expects
         rpc_params = {
