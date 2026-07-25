@@ -37,6 +37,7 @@ Outbound RPC Response (edge → cloud):
 }
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -45,6 +46,10 @@ import hashlib
 from time import time, monotonic
 from typing import Optional
 from novena_gateway.gateway.hardware_preflight import run_preflight
+from novena_gateway.gateway.governed_commands import (
+    GovernedCommandGuard,
+    GovernedCommandRejected,
+)
 from novena_gateway.gateway.ota_security import (
     DEFAULT_OTA_PUBLIC_KEY_PATH,
     OtaSecurityError,
@@ -87,6 +92,11 @@ class RpcHandler:
         self._inbound_topic = f"v1/gateway/{self._serial_number}/rpc/request"
         self._start_time = monotonic()
         self._helper = PrivilegedCommandRunner(self._handler_config.get("helper_path"))
+        self._governance = GovernedCommandGuard(
+            serial_number=serial_number,
+            gateway=gateway,
+            config=self._handler_config,
+        )
 
         # Command dispatch table
         self._commands = {
@@ -117,11 +127,26 @@ class RpcHandler:
             return
 
         self._publisher.subscribe(self._inbound_topic, self._on_rpc_request)
+        self._publisher.subscribe(
+            f"v1/gateway/{self._serial_number}/control/policy",
+            self._on_control_policy,
+        )
         log.info("RPC handler started, listening on: %s", self._inbound_topic)
 
     def stop(self):
         """No persistent resources to clean up."""
         pass
+
+    def _on_control_policy(self, topic, payload):
+        try:
+            self._governance.install_policy(topic, payload)
+            log.info(
+                "Installed governed-control policy revision %s at epoch %s",
+                self._governance.policy_revision,
+                self._governance.control_epoch,
+            )
+        except GovernedCommandRejected as exc:
+            log.warning("Rejected governed-control policy: %s", exc)
 
     def _on_rpc_request(self, topic: str, payload: dict):
         """Handle an inbound RPC request."""
@@ -185,33 +210,80 @@ class RpcHandler:
                     stage="rejected",
                 )
                 return
+            try:
+                governed_control, replay = self._governance.validate(payload)
+            except GovernedCommandRejected as exc:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error=str(exc),
+                    stage="rejected",
+                )
+                return
+            if replay:
+                self._send_response(
+                    request_id,
+                    method,
+                    status=replay["status"],
+                    result=replay.get("result"),
+                    error=replay.get("error"),
+                    stage=replay.get("stage") or "replayed_terminal_result",
+                )
+                return
+        else:
+            governed_control = None
 
         self._send_response(request_id, method, status="received", stage="gateway_received")
 
         import threading
 
         def execute():
+            lock = (
+                self._governance.device_lock(payload["target"]["device_id"])
+                if method in STATE_CHANGING_COMMANDS
+                else contextlib.nullcontext()
+            )
             try:
-                result = handler(params)
-                status = "success"
-                error = None
-                if method in ("read_device", "write_device", "register_preflight") and isinstance(result, dict):
-                    if result.get("error") or result.get("device_accepted") is False:
-                        status = "error"
-                        error = result.get("error") or "Device command was not accepted"
-                stage = "field_protocol_accepted" if status == "success" else "failed"
-                if method not in ("read_device", "write_device", "register_preflight"):
-                    stage = "executed" if status == "success" else "failed"
-                self._send_response(
-                    request_id,
-                    method,
-                    status=status,
-                    result=result,
-                    error=error,
-                    stage=stage,
-                )
+                with lock:
+                    if method in STATE_CHANGING_COMMANDS:
+                        self._governance.enforce_prerequisites(governed_control, params)
+                        self._governance.mark_executing(payload)
+                    result = handler(params)
+                    status = "success"
+                    error = None
+                    if method in ("read_device", "write_device", "register_preflight") and isinstance(result, dict):
+                        if result.get("error") or result.get("device_accepted") is False:
+                            status = "error"
+                            error = result.get("error") or "Device command was not accepted"
+                    stage = "field_protocol_accepted" if status == "success" else "failed"
+                    if method not in ("read_device", "write_device", "register_preflight"):
+                        stage = "executed" if status == "success" else "failed"
+                    if method in STATE_CHANGING_COMMANDS:
+                        self._governance.mark_terminal(
+                            payload,
+                            status=status,
+                            result=result,
+                            error=error,
+                            stage=stage,
+                        )
+                    self._send_response(
+                        request_id,
+                        method,
+                        status=status,
+                        result=result,
+                        error=error,
+                        stage=stage,
+                    )
             except Exception as e:
                 log.exception("RPC command '%s' failed: %s", method, e)
+                if method in STATE_CHANGING_COMMANDS:
+                    self._governance.mark_terminal(
+                        payload,
+                        status="error",
+                        error=str(e),
+                        stage="failed",
+                    )
                 self._send_response(request_id, method, status="error", error=str(e), stage="failed")
 
         thread = threading.Thread(target=execute, name=f"RPC-{method}-{request_id[:8]}")

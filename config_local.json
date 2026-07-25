@@ -52,7 +52,12 @@
     },
     "rpc": {
       "enabled": true,
-      "local_writeback_enabled": false
+      "local_writeback_enabled": false,
+      "trusted_clock": false,
+      "max_clock_offset_seconds": 5,
+      "trusted_command_keys": {},
+      "command_policy_path": "storage/remote_control/policy.json",
+      "command_journal_path": "storage/remote_control/command_journal.json"
     }
   },
   "connectors": [

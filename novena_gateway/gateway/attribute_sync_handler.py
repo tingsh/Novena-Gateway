@@ -154,6 +154,9 @@ class AttributeSyncHandler:
             ),
             "remote_control_policy_loaded": False,
         }
+        rpc_handler = getattr(self._gateway, "_rpc_handler", None)
+        if rpc_handler and getattr(rpc_handler, "_governance", None):
+            attrs.update(rpc_handler._governance.readiness())
 
         # Merge network watchdog fields if available
         if hasattr(self._gateway, "_network_watchdog") and self._gateway._network_watchdog:

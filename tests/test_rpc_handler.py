@@ -448,7 +448,7 @@ class TestRpcHandler(unittest.TestCase):
         self.assertIn("disabled", payload["error"])
         self.assertIsNone(self.mock_gateway._mock_connector.last_rpc_content)
 
-    def test_locally_enabled_write_requires_canonical_identity(self):
+    def test_locally_enabled_write_still_requires_signed_retained_policy(self):
         self.handler._local_writeback_enabled = True
         self.handler._on_rpc_request("test/topic", {
             "request_id": "req-write-002",
@@ -469,32 +469,19 @@ class TestRpcHandler(unittest.TestCase):
                 break
             time.sleep(0.001)
         payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
-        self.assertEqual(payload["status"], "success")
-        self.assertEqual(payload["result"]["operation"], "write")
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("Trusted clock", payload["error"])
 
     def test_write_rejects_mutable_name_mismatch(self):
-        self.handler._local_writeback_enabled = True
-        self.handler._on_rpc_request("test/topic", {
-            "request_id": "req-write-003",
-            "method": "write_device",
-            "schema_version": 1,
-            "command_id": "command-003",
-            "params": {
+        with self.assertRaises(ValueError) as raised:
+            self.handler._cmd_write_device({
                 "device_id": "device-001",
                 "device_name": "Renamed Device",
                 "functionCode": 6,
                 "address": 100,
                 "value": 1500,
-            },
-        })
-
-        for _ in range(100):
-            if self.mock_publisher.publish_rpc_response.call_count >= 2:
-                break
-            time.sleep(0.001)
-        payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
-        self.assertEqual(payload["status"], "error")
-        self.assertIn("does not match", payload["error"])
+            })
+        self.assertIn("does not match", str(raised.exception))
 
     def test_read_device_via_rpc_dispatch(self):
         """read_device should work through the full RPC dispatch path."""
