@@ -145,6 +145,14 @@ class AttributeSyncHandler:
             "active_connectors": active_connectors,
             "device_count": len(connected_devices),
             "status": status,
+            "remote_control_protocol_version": 1,
+            "remote_control_local_writeback_enabled": bool(
+                getattr(self._gateway, "_config", {})
+                .get("features", {})
+                .get("rpc", {})
+                .get("local_writeback_enabled", False)
+            ),
+            "remote_control_policy_loaded": False,
         }
 
         # Merge network watchdog fields if available

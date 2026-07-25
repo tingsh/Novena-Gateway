@@ -255,6 +255,7 @@ class NovenaGateway:
         self._devices[device_name] = {
             "device_type": device_type,
             "connector": content.get("connector"),
+            "device_id": content.get("device_id"),
         }
         self._ensure_device_health(device_name)
         log.info("Device registered: %s (type=%s)", device_name, device_type)

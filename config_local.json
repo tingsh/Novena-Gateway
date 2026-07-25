@@ -51,7 +51,8 @@
       "last_known_good_path": "last_known_good_config.json"
     },
     "rpc": {
-      "enabled": true
+      "enabled": true,
+      "local_writeback_enabled": false
     }
   },
   "connectors": [

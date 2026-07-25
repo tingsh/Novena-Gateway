@@ -7,6 +7,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -51,6 +52,7 @@ class MockGateway:
             "Power Meter 1": {
                 "device_type": "power_meter",
                 "connector": self._mock_connector,
+                "device_id": "device-001",
             }
         }
         self._config = {"connectors": []}
@@ -248,7 +250,10 @@ class TestRpcHandler(unittest.TestCase):
             "params": {}
         })
 
-        self.mock_publisher.publish_rpc_response.assert_called_once()
+        self.assertEqual(self.mock_publisher.publish_rpc_response.call_count, 2)
+        receipt = self.mock_publisher.publish_rpc_response.call_args_list[0][0][0]
+        self.assertEqual(receipt["status"], "received")
+        self.assertEqual(receipt["stage"], "gateway_received")
         payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
         self.assertEqual(payload["request_id"], "req-001")
         self.assertEqual(payload["method"], "ping")
@@ -273,6 +278,7 @@ class TestRpcHandler(unittest.TestCase):
     def test_write_device_calls_connector(self):
         """write_device should route to the connector's server_side_rpc_handler."""
         result = self.handler._cmd_write_device({
+            "device_id": "device-001",
             "device_name": "Power Meter 1",
             "functionCode": 6,
             "address": 100,
@@ -325,6 +331,7 @@ class TestRpcHandler(unittest.TestCase):
         """write_device should reject read function codes."""
         with self.assertRaises(ValueError) as ctx:
             self.handler._cmd_write_device({
+                "device_id": "device-001",
                 "device_name": "Power Meter 1",
                 "functionCode": 3,
                 "address": 100,
@@ -346,17 +353,18 @@ class TestRpcHandler(unittest.TestCase):
         """write_device should error for unknown device."""
         with self.assertRaises(ValueError) as ctx:
             self.handler._cmd_write_device({
+                "device_id": "ghost-device",
                 "device_name": "Ghost Device",
                 "functionCode": 6,
                 "address": 100,
                 "value": 42,
             })
-        self.assertIn("not found", str(ctx.exception))
+        self.assertIn("not uniquely mapped", str(ctx.exception))
 
     def test_write_device_missing_params(self):
         """write_device should error when required params are missing."""
         with self.assertRaises(ValueError):
-            self.handler._cmd_write_device({"device_name": "Power Meter 1"})
+            self.handler._cmd_write_device({"device_id": "device-001", "device_name": "Power Meter 1"})
 
     def test_read_device_missing_params(self):
         """read_device should error when required params are missing."""
@@ -366,6 +374,7 @@ class TestRpcHandler(unittest.TestCase):
     def test_write_device_rejects_malformed_address(self):
         with self.assertRaises(ValueError) as ctx:
             self.handler._cmd_write_device({
+                "device_id": "device-001",
                 "device_name": "Power Meter 1",
                 "functionCode": 6,
                 "address": "abc",
@@ -388,6 +397,7 @@ class TestRpcHandler(unittest.TestCase):
         self.mock_gateway._devices["Power Meter 1"]["connector"] = error_connector
 
         result = self.handler._cmd_write_device({
+            "device_id": "device-001",
             "device_name": "Power Meter 1",
             "functionCode": 6,
             "address": 100,
@@ -410,12 +420,15 @@ class TestRpcHandler(unittest.TestCase):
 
         self.assertEqual(result["config_update_status"], "success")
 
-    def test_write_device_via_rpc_dispatch(self):
-        """write_device should work through the full RPC dispatch path."""
+    def test_write_device_via_rpc_dispatch_is_default_denied(self):
+        """A fresh Gateway must remain monitoring-only even for a valid write shape."""
         self.handler._on_rpc_request("test/topic", {
             "request_id": "req-write-001",
             "method": "write_device",
+            "schema_version": 1,
+            "command_id": "command-001",
             "params": {
+                "device_id": "device-001",
                 "device_name": "Power Meter 1",
                 "functionCode": 6,
                 "address": 100,
@@ -423,11 +436,65 @@ class TestRpcHandler(unittest.TestCase):
             }
         })
 
+        for _ in range(100):
+            if self.mock_publisher.publish_rpc_response.call_count >= 2:
+                break
+            time.sleep(0.001)
         payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
         self.assertEqual(payload["request_id"], "req-write-001")
         self.assertEqual(payload["method"], "write_device")
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["stage"], "rejected")
+        self.assertIn("disabled", payload["error"])
+        self.assertIsNone(self.mock_gateway._mock_connector.last_rpc_content)
+
+    def test_locally_enabled_write_requires_canonical_identity(self):
+        self.handler._local_writeback_enabled = True
+        self.handler._on_rpc_request("test/topic", {
+            "request_id": "req-write-002",
+            "method": "write_device",
+            "schema_version": 1,
+            "command_id": "command-002",
+            "params": {
+                "device_id": "device-001",
+                "device_name": "Power Meter 1",
+                "functionCode": 6,
+                "address": 100,
+                "value": 1500,
+            },
+        })
+
+        for _ in range(100):
+            if self.mock_publisher.publish_rpc_response.call_count >= 2:
+                break
+            time.sleep(0.001)
+        payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["result"]["operation"], "write")
+
+    def test_write_rejects_mutable_name_mismatch(self):
+        self.handler._local_writeback_enabled = True
+        self.handler._on_rpc_request("test/topic", {
+            "request_id": "req-write-003",
+            "method": "write_device",
+            "schema_version": 1,
+            "command_id": "command-003",
+            "params": {
+                "device_id": "device-001",
+                "device_name": "Renamed Device",
+                "functionCode": 6,
+                "address": 100,
+                "value": 1500,
+            },
+        })
+
+        for _ in range(100):
+            if self.mock_publisher.publish_rpc_response.call_count >= 2:
+                break
+            time.sleep(0.001)
+        payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("does not match", payload["error"])
 
     def test_read_device_via_rpc_dispatch(self):
         """read_device should work through the full RPC dispatch path."""

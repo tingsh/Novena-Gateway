@@ -58,6 +58,16 @@ from novena_gateway.gateway.redaction import redact_secrets
 
 log = logging.getLogger("novena_gateway.rpc_handler")
 
+REMOTE_CONTROL_PROTOCOL_VERSION = 1
+STATE_CHANGING_COMMANDS = {
+    "set_log_level",
+    "restart_connector",
+    "restart_all",
+    "reboot",
+    "write_device",
+    "update_firmware",
+}
+
 
 class RpcHandler:
     """Handles inbound RPC commands from Novena Hub."""
@@ -71,6 +81,9 @@ class RpcHandler:
         self._handler_config = config or {}
 
         self._enabled = self._handler_config.get("enabled", True)
+        self._local_writeback_enabled = bool(
+            self._handler_config.get("local_writeback_enabled", False)
+        )
         self._inbound_topic = f"v1/gateway/{self._serial_number}/rpc/request"
         self._start_time = monotonic()
         self._helper = PrivilegedCommandRunner(self._handler_config.get("helper_path"))
@@ -112,6 +125,9 @@ class RpcHandler:
 
     def _on_rpc_request(self, topic: str, payload: dict):
         """Handle an inbound RPC request."""
+        if not isinstance(payload, dict):
+            log.warning("Rejected malformed RPC payload: expected an object")
+            return
         request_id = payload.get("request_id", "unknown")
         method = payload.get("method", "")
         params = payload.get("params", {})
@@ -121,8 +137,56 @@ class RpcHandler:
         handler = self._commands.get(method)
         if not handler:
             self._send_response(request_id, method, status="error",
-                                error=f"Unknown RPC method: {method}")
+                                error=f"Unknown RPC method: {method}", stage="rejected")
             return
+        if not isinstance(params, dict):
+            self._send_response(
+                request_id,
+                method,
+                status="error",
+                error="RPC params must be an object",
+                stage="rejected",
+            )
+            return
+        if method in STATE_CHANGING_COMMANDS:
+            if not self._local_writeback_enabled:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Local write-back is disabled on this Gateway",
+                    stage="rejected",
+                )
+                return
+            if payload.get("schema_version") != REMOTE_CONTROL_PROTOCOL_VERSION:
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Unsupported or missing governed-command schema version",
+                    stage="rejected",
+                )
+                return
+            if not payload.get("command_id"):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed state-changing commands require command_id",
+                    stage="rejected",
+                )
+                return
+            if method == "write_device" and not params.get("device_id"):
+                self._send_response(
+                    request_id,
+                    method,
+                    status="error",
+                    error="Governed device writes require canonical device_id",
+                    stage="rejected",
+                )
+                return
+
+        self._send_response(request_id, method, status="received", stage="gateway_received")
 
         import threading
 
@@ -135,17 +199,27 @@ class RpcHandler:
                     if result.get("error") or result.get("device_accepted") is False:
                         status = "error"
                         error = result.get("error") or "Device command was not accepted"
-                self._send_response(request_id, method, status=status, result=result, error=error)
+                stage = "field_protocol_accepted" if status == "success" else "failed"
+                if method not in ("read_device", "write_device", "register_preflight"):
+                    stage = "executed" if status == "success" else "failed"
+                self._send_response(
+                    request_id,
+                    method,
+                    status=status,
+                    result=result,
+                    error=error,
+                    stage=stage,
+                )
             except Exception as e:
                 log.exception("RPC command '%s' failed: %s", method, e)
-                self._send_response(request_id, method, status="error", error=str(e))
+                self._send_response(request_id, method, status="error", error=str(e), stage="failed")
 
         thread = threading.Thread(target=execute, name=f"RPC-{method}-{request_id[:8]}")
         thread.daemon = True
         thread.start()
 
     def _send_response(self, request_id: str, method: str, status: str,
-                       result=None, error=None):
+                       result=None, error=None, stage=None):
         """Publish an RPC response to the cloud."""
         payload = {
             "serial_number": self._serial_number,
@@ -153,6 +227,7 @@ class RpcHandler:
             "method": method,
             "ts": int(time() * 1000),
             "status": status,
+            "stage": stage or status,
             "result": result,
             "error": error,
         }
@@ -341,6 +416,23 @@ class RpcHandler:
 
         return connector, device_info
 
+    def _resolve_canonical_device(self, device_id: str):
+        """Resolve an immutable commissioned identifier to the live connector entry."""
+        matches = [
+            (name, info)
+            for name, info in self._gateway.get_devices().items()
+            if str(info.get("device_id") or "") == str(device_id)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Canonical device_id '{device_id}' is not uniquely mapped in the gateway registry"
+            )
+        device_name, device_info = matches[0]
+        connector = device_info.get("connector")
+        if not connector:
+            raise ValueError(f"Device '{device_id}' has no connector reference")
+        return device_name, connector, device_info
+
     def _build_connector_rpc_content(self, device_name: str, method: str, params: dict) -> dict:
         """
         Build the content dict expected by connector.server_side_rpc_handler().
@@ -443,9 +535,13 @@ class RpcHandler:
             "timeout": 5.0           // optional: seconds
         }
         """
-        device_name = params.get("device_name")
-        if not device_name:
-            raise ValueError("Missing 'device_name' parameter")
+        device_id = params.get("device_id")
+        if not device_id:
+            raise ValueError("Missing 'device_id' parameter")
+        device_name, connector, _ = self._resolve_canonical_device(device_id)
+        requested_name = params.get("device_name")
+        if requested_name and requested_name != device_name:
+            raise ValueError("device_name does not match canonical device_id")
 
         function_code = params.get("functionCode")
         if function_code is None:
@@ -460,8 +556,6 @@ class RpcHandler:
             raise ValueError("Missing 'value' parameter")
         if params["value"] is None:
             raise ValueError("Invalid 'value' parameter: value cannot be null")
-
-        connector, _ = self._find_connector_for_device(device_name)
 
         # Build the RPC content in the format the connector expects
         rpc_params = {
