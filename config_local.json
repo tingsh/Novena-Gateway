@@ -56,6 +56,7 @@
       "trusted_clock": false,
       "max_clock_offset_seconds": 5,
       "trusted_command_keys": {},
+      "revoked_command_key_ids": [],
       "command_policy_path": "storage/remote_control/policy.json",
       "command_journal_path": "storage/remote_control/command_journal.json"
     }
