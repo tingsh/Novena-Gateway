@@ -217,6 +217,10 @@ class TestRemoteConfigHandler(unittest.TestCase):
         self.assertEqual(payload["attributes"]["config_update_status"], "rolled_back")
         self.assertTrue(payload["attributes"]["rollback_performed"])
         self.assertEqual(payload["attributes"]["connector_results"][0]["status"], "error")
+        self.assertEqual(
+            payload["attributes"]["rollback_connector_results"][0]["status"],
+            "error",
+        )
 
     def test_get_status_returns_last_update_result(self):
         result = self.handler._apply_full_update({

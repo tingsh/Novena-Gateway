@@ -11,7 +11,9 @@ Supports:
 """
 
 import glob
+import ipaddress
 import logging
+import math
 import subprocess
 import socket
 import struct
@@ -49,7 +51,8 @@ class DiscoveryService:
         self._scan_interval_seconds = self._config.get("scan_interval_seconds", 3600)
         self._rtu_slave_range = self._config.get("rtu_slave_range", [1, 32])
         self._rtu_baud_rates = self._config.get("rtu_baud_rates", [9600, 19200])
-        self._tcp_subnet_scan = self._config.get("tcp_subnet_scan", True)
+        # Broad subnet scanning is opt-in and never enabled by a Hub request.
+        self._tcp_subnet_scan = self._config.get("tcp_subnet_scan", False)
         self._tcp_scan_timeout_ms = self._config.get("tcp_scan_timeout_ms", 500)
         self._tcp_hosts = self._config.get("tcp_hosts", [])
         self._tcp_ports = self._config.get("tcp_ports", [502])
@@ -57,6 +60,9 @@ class DiscoveryService:
         self._scan_thread = None
         self._periodic_thread = None
         self._stopped = False
+        self._scan_cancelled = threading.Event()
+        self._scan_lock = threading.Lock()
+        self._guided_scan_thread = None
         self._last_report = None
 
     def start(self):
@@ -81,6 +87,37 @@ class DiscoveryService:
     def stop(self):
         """Cancel any pending scans."""
         self._stopped = True
+        self._scan_cancelled.set()
+
+    def cancel_current_scan(self):
+        """Cancel the active scan without stopping the service permanently."""
+        self._scan_cancelled.set()
+
+    def start_guided_scan(self, options: Optional[dict] = None):
+        """Start a guided scan off the MQTT callback thread so it can be cancelled."""
+        if self._scan_lock.locked() or (
+            self._guided_scan_thread and self._guided_scan_thread.is_alive()
+        ):
+            raise RuntimeError("A discovery scan is already running")
+
+        self._scan_cancelled.clear()
+
+        def run():
+            try:
+                self.scan(
+                    scan_type="guided",
+                    options=options or {},
+                    reset_cancel=False,
+                )
+            except Exception as exc:
+                log.exception("Guided discovery scan failed: %s", exc)
+
+        self._guided_scan_thread = threading.Thread(
+            target=run,
+            name="GuidedDiscovery",
+            daemon=True,
+        )
+        self._guided_scan_thread.start()
 
     def _boot_scan(self):
         """Run a scan after a delay to let MQTT connection establish."""
@@ -112,10 +149,21 @@ class DiscoveryService:
             except Exception as e:
                 log.exception("Periodic discovery scan failed: %s", e)
 
-    def scan(self, scan_type: str = "manual") -> dict:
+    def scan(
+        self,
+        scan_type: str = "manual",
+        options: Optional[dict] = None,
+        *,
+        reset_cancel: bool = True,
+    ) -> dict:
         """
         Execute a full discovery scan. Returns the discovery report dict.
         """
+        if not self._scan_lock.acquire(blocking=False):
+            raise RuntimeError("A discovery scan is already running")
+        if reset_cancel:
+            self._scan_cancelled.clear()
+        options = options or {}
         log.info("Starting discovery scan (type=%s)...", scan_type)
         scan_ts = int(time() * 1000)
 
@@ -123,45 +171,76 @@ class DiscoveryService:
         discovered_devices = []
         errors = []
 
-        # 1. Enumerate and scan serial interfaces for Modbus RTU
-        serial_ports = self._enumerate_serial_ports()
-        for port in serial_ports:
-            interfaces.append({"name": port, "type": "serial", "label": self._serial_label(port)})
-            try:
-                devices = self._scan_rtu_interface(port)
-                discovered_devices.extend(devices)
-            except Exception as e:
-                log.warning("Error scanning RTU port %s: %s", port, e)
-                errors.append({"interface": port, "error": str(e)})
+        try:
+            requested_serial_ports = options.get("serial_ports")
+            serial_ports = self._approved_serial_ports(requested_serial_ports)
+            for port in serial_ports:
+                if self._cancelled:
+                    break
+                interfaces.append({"name": port, "type": "serial", "label": self._serial_label(port)})
+                try:
+                    devices = self._scan_rtu_interface(port)
+                    discovered_devices.extend(devices)
+                    self._publish_progress(scan_ts, scan_type, interfaces, discovered_devices, errors)
+                except Exception as e:
+                    log.warning("Error scanning RTU port %s: %s", port, e)
+                    errors.append({"interface": port, "error": str(e)})
 
-        # 2. Scan local network for Modbus TCP
-        if self._tcp_subnet_scan:
-            interfaces.append({"name": "eth0", "type": "ethernet", "label": "LAN"})
-            try:
-                tcp_devices = self._scan_tcp_network()
-                discovered_devices.extend(tcp_devices)
-            except Exception as e:
-                log.warning("Error during TCP subnet scan: %s", e)
-                errors.append({"interface": "tcp", "error": str(e)})
+            approved_targets = self._approved_tcp_targets(options.get("tcp_hosts"))
+            if approved_targets or (scan_type != "guided" and self._tcp_subnet_scan):
+                interfaces.append({"name": "ethernet", "type": "ethernet", "label": "Approved LAN targets"})
+                try:
+                    tcp_devices = self._scan_tcp_network(
+                        approved_targets=approved_targets,
+                        progress_callback=lambda partial: self._publish_progress(
+                            scan_ts,
+                            scan_type,
+                            interfaces,
+                            discovered_devices + partial,
+                            errors,
+                        ),
+                    )
+                    discovered_devices.extend(tcp_devices)
+                except Exception as e:
+                    log.warning("Error during TCP scan: %s", e)
+                    errors.append({"interface": "tcp", "error": str(e)})
 
-        report = {
-            "scan_ts": scan_ts,
-            "scan_type": scan_type,
-            "interfaces": interfaces,
-            "discovered_devices": discovered_devices,
-            "errors": errors,
-        }
+            report = {
+                "scan_ts": scan_ts,
+                "scan_type": scan_type,
+                "status": "cancelled" if self._cancelled else "complete",
+                "interfaces": interfaces,
+                "discovered_devices": discovered_devices,
+                "errors": errors,
+            }
 
-        self._last_report = report
-        log.info(
-            "Discovery scan complete: %d devices found across %d interfaces",
-            len(discovered_devices), len(interfaces),
-        )
+            self._last_report = report
+            log.info(
+                "Discovery scan complete: %d devices found across %d interfaces",
+                len(discovered_devices), len(interfaces),
+            )
+            self._publish_report(report)
+            return report
+        finally:
+            self._scan_lock.release()
 
-        # Publish report as attribute to Cloud
-        self._publish_report(report)
+    @property
+    def _cancelled(self) -> bool:
+        return self._stopped or self._scan_cancelled.is_set()
 
-        return report
+    def _approved_serial_ports(self, requested_ports) -> list[str]:
+        available = self._enumerate_serial_ports()
+        if requested_ports is None:
+            return available
+        if not isinstance(requested_ports, list):
+            raise ValueError("serial_ports must be a list")
+        approved = []
+        for port in requested_ports[:8]:
+            port = str(port)
+            if port not in available:
+                raise ValueError(f"Serial interface is not available: {port}")
+            approved.append(port)
+        return approved
 
     def get_last_report(self) -> Optional[dict]:
         return self._last_report
@@ -191,7 +270,7 @@ class DiscoveryService:
         slave_min, slave_max = self._rtu_slave_range
 
         for baud_rate in self._rtu_baud_rates:
-            if self._stopped:
+            if self._cancelled:
                 break
             try:
                 client = ModbusSerialClient(
@@ -202,7 +281,7 @@ class DiscoveryService:
                     continue
 
                 for slave_id in range(slave_min, slave_max + 1):
-                    if self._stopped:
+                    if self._cancelled:
                         break
                     try:
                         result = client.read_holding_registers(0, 1, slave=slave_id)
@@ -231,8 +310,8 @@ class DiscoveryService:
 
     # ─── TCP scanning ─────────────────────────────────────────────────
 
-    def _scan_tcp_network(self) -> list:
-        """Scan local subnet for Modbus TCP devices on port 502."""
+    def _scan_tcp_network(self, approved_targets=None, progress_callback=None) -> list:
+        """Scan configured or explicitly approved Modbus TCP targets."""
         try:
             from pymodbus.client import ModbusTcpClient
         except ImportError:
@@ -242,13 +321,13 @@ class DiscoveryService:
         devices = []
         timeout_s = self._tcp_scan_timeout_ms / 1000.0
 
-        targets = self._configured_tcp_targets()
-        if self._tcp_subnet_scan:
+        targets = list(approved_targets or self._configured_tcp_targets())
+        if approved_targets is None and self._tcp_subnet_scan:
             targets.extend(self._subnet_tcp_targets())
 
         seen_targets = set()
         for ip, port in targets:
-            if self._stopped:
+            if self._cancelled:
                 break
             key = (ip, int(port))
             if key in seen_targets:
@@ -257,8 +336,41 @@ class DiscoveryService:
             device = self._probe_tcp_target(ModbusTcpClient, ip, int(port), timeout_s)
             if device:
                 devices.append(device)
+            if progress_callback:
+                progress_callback(list(devices))
 
         return devices
+
+    def _approved_tcp_targets(self, requested_hosts) -> list[tuple[str, int]]:
+        if requested_hosts is None:
+            return []
+        if not isinstance(requested_hosts, list):
+            raise ValueError("tcp_hosts must be a list")
+        if len(requested_hosts) > 64:
+            raise ValueError("A guided scan is limited to 64 approved targets")
+        targets = []
+        for item in requested_hosts:
+            if isinstance(item, dict):
+                host = item.get("host") or item.get("ip")
+                port = item.get("port", 502)
+            else:
+                value = str(item)
+                host, separator, raw_port = value.rpartition(":")
+                if not separator:
+                    host, port = value, 502
+                else:
+                    port = raw_port
+            try:
+                parsed = ipaddress.ip_address(str(host))
+                parsed_port = int(port)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Invalid approved Modbus TCP target: {item}") from exc
+            if parsed.is_unspecified or parsed.is_multicast or parsed.is_reserved:
+                raise ValueError(f"Unsafe Modbus TCP target: {host}")
+            if not 1 <= parsed_port <= 65535:
+                raise ValueError(f"Invalid Modbus TCP port: {parsed_port}")
+            targets.append((str(parsed), parsed_port))
+        return targets
 
     def _configured_tcp_targets(self) -> list[tuple[str, int]]:
         targets = []
@@ -397,6 +509,158 @@ class DiscoveryService:
                 break
         return last_good
 
+    def validate_modbus(self, params: dict) -> dict:
+        """Perform non-destructive reads against a proposed Modbus setup."""
+        protocol = params.get("protocol")
+        connection = params.get("connection") or {}
+        datapoints = params.get("datapoints") or []
+        if protocol not in {"modbus_tcp", "modbus_rtu"}:
+            raise ValueError("Only Modbus TCP and Modbus RTU validation are supported")
+        if not isinstance(datapoints, list) or not datapoints:
+            raise ValueError("At least one datapoint is required for validation")
+        if len(datapoints) > 20:
+            raise ValueError("Validation is limited to 20 datapoints")
+
+        slave_id = int(connection.get("slave_id", 1))
+        if not 1 <= slave_id <= 247:
+            raise ValueError("Slave ID must be between 1 and 247")
+
+        if protocol == "modbus_tcp":
+            targets = self._approved_tcp_targets(
+                [{"host": connection.get("host"), "port": connection.get("port", 502)}]
+            )
+            host, port = targets[0]
+            from pymodbus.client import ModbusTcpClient
+
+            client = ModbusTcpClient(host, port=port, timeout=min(float(connection.get("timeout", 3)), 10))
+        else:
+            port = str(connection.get("serial_port") or "")
+            if port not in self._enumerate_serial_ports():
+                raise ValueError("The selected serial interface is not available")
+            from pymodbus.client import ModbusSerialClient
+
+            client = ModbusSerialClient(
+                port=port,
+                baudrate=int(connection.get("baudrate", 9600)),
+                parity=str(connection.get("parity", "N")).upper(),
+                stopbits=int(connection.get("stopbits", 1)),
+                bytesize=8,
+                timeout=min(float(connection.get("timeout", 3)), 10),
+            )
+
+        results = []
+        try:
+            if not client.connect():
+                raise ConnectionError("The Gateway could not connect to this equipment")
+            for datapoint in datapoints:
+                address = int(datapoint.get("address", 0))
+                count = int(datapoint.get("objectsCount", 1))
+                function_code = int(datapoint.get("functionCode", 3))
+                if not 0 <= address <= 65535 or not 1 <= count <= 4:
+                    raise ValueError("Datapoint address or register count is outside the safe validation range")
+                if function_code == 4:
+                    response = client.read_input_registers(address, count, slave=slave_id)
+                elif function_code == 3:
+                    response = client.read_holding_registers(address, count, slave=slave_id)
+                elif function_code == 2:
+                    response = client.read_discrete_inputs(address, count, slave=slave_id)
+                elif function_code == 1:
+                    response = client.read_coils(address, count, slave=slave_id)
+                else:
+                    raise ValueError("Validation supports read-only Modbus function codes 1, 2, 3, and 4")
+                if not response or response.isError():
+                    results.append(
+                        {"key": datapoint.get("key", f"register_{address}"), "status": "failed", "address": address}
+                    )
+                    continue
+                value = getattr(response, "registers", None) or getattr(response, "bits", None) or []
+                try:
+                    decoded = self._decode_validation_value(
+                        value[:count],
+                        datapoint,
+                        connection,
+                        bits=function_code in {1, 2},
+                    )
+                except (TypeError, ValueError, struct.error) as exc:
+                    results.append(
+                        {
+                            "key": datapoint.get("key", f"register_{address}"),
+                            "status": "failed",
+                            "address": address,
+                            "reason": str(exc),
+                        }
+                    )
+                    continue
+                results.append(
+                    {
+                        "key": datapoint.get("key", f"register_{address}"),
+                        "status": "success",
+                        "address": address,
+                        "sample": list(value[:count]),
+                        "value": decoded,
+                        "unit": str(datapoint.get("unit") or ""),
+                    }
+                )
+        finally:
+            client.close()
+
+        successful = [item for item in results if item["status"] == "success"]
+        return {
+            "status": "success" if len(successful) == len(results) else ("partial" if successful else "failed"),
+            "message": (
+                f"{len(successful)} of {len(results)} selected signals were read successfully."
+                if successful
+                else "The Gateway connected, but could not read the selected signals."
+            ),
+            "signals": results,
+            "retryable": True,
+        }
+
+    @staticmethod
+    def _decode_validation_value(values, datapoint, connection, *, bits=False):
+        if not values:
+            raise ValueError("The equipment returned no value")
+        if bits:
+            decoded = bool(values[0])
+        else:
+            data_type = str(datapoint.get("data_type") or "uint16").lower()
+            formats = {
+                "uint16": (1, ">H"),
+                "int16": (1, ">h"),
+                "uint32": (2, ">I"),
+                "int32": (2, ">i"),
+                "float32": (2, ">f"),
+            }
+            required, fmt = formats.get(data_type, (None, None))
+            if required is None:
+                raise ValueError(f"Unsupported validation data type: {data_type}")
+            if len(values) < required:
+                raise ValueError(f"{data_type} needs {required} Modbus registers")
+            words = [int(value) & 0xFFFF for value in values[:required]]
+            if str(connection.get("wordOrder", "BIG")).upper() == "LITTLE" and required > 1:
+                words.reverse()
+            raw = bytearray()
+            for word in words:
+                encoded = word.to_bytes(2, byteorder="big")
+                if str(connection.get("byteOrder", "BIG")).upper() == "LITTLE":
+                    encoded = encoded[::-1]
+                raw.extend(encoded)
+            decoded = struct.unpack(fmt, bytes(raw))[0]
+            decoded = decoded * float(datapoint.get("scale", 1)) + float(
+                datapoint.get("offset", 0)
+            )
+            if isinstance(decoded, float) and not math.isfinite(decoded):
+                raise ValueError("Decoded value is not finite; check data type and byte order")
+
+        quality = datapoint.get("quality") or {}
+        minimum = quality.get("min", datapoint.get("min"))
+        maximum = quality.get("max", datapoint.get("max"))
+        if minimum is not None and float(decoded) < float(minimum):
+            raise ValueError("Decoded value is below the expected range")
+        if maximum is not None and float(decoded) > float(maximum):
+            raise ValueError("Decoded value is above the expected range")
+        return decoded
+
     # ─── Helpers ──────────────────────────────────────────────────────
 
     def _get_local_ip(self) -> Optional[str]:
@@ -467,3 +731,15 @@ class DiscoveryService:
         }
         self._publisher.publish_attributes(payload)
         log.info("Published discovery report to Cloud (%d devices)", len(report.get("discovered_devices", [])))
+
+    def _publish_progress(self, scan_ts, scan_type, interfaces, devices, errors):
+        self._publish_report(
+            {
+                "scan_ts": scan_ts,
+                "scan_type": scan_type,
+                "status": "running",
+                "interfaces": list(interfaces),
+                "discovered_devices": list(devices),
+                "errors": list(errors),
+            }
+        )

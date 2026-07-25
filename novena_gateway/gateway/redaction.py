@@ -58,3 +58,21 @@ def redact_text(text: str) -> str:
                 lower = redacted.lower()
                 idx = lower.find(marker, start + len(REDACTED))
     return redacted
+
+
+def redact_diagnostics(value):
+    """Redact both sensitive keys and inline assignments in diagnostic evidence."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED
+                if is_sensitive_key(key) and child not in (None, "")
+                else redact_diagnostics(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_diagnostics(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return deepcopy(value)

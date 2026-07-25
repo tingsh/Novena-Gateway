@@ -35,7 +35,17 @@ import os
 import shutil
 from time import time
 from typing import Optional
-from novena_gateway.gateway.redaction import redact_secrets
+
+from novena_gateway.gateway.deployment_setup import (
+    CAPABILITY_GUIDED_SETUP,
+    ConfigEnvelopeGuard,
+    DeploymentSetupRejected,
+)
+from novena_gateway.gateway.redaction import (
+    redact_diagnostics,
+    redact_secrets,
+    redact_text,
+)
 
 log = logging.getLogger("novena_gateway.remote_config")
 
@@ -74,6 +84,14 @@ class RemoteConfigHandler:
             "connector_results": [],
             "config_version_ts": None,
         }
+        self._envelope_guard = ConfigEnvelopeGuard(
+            serial_number=serial_number,
+            config=self._handler_config,
+        )
+
+    @property
+    def capabilities(self) -> list[str]:
+        return [CAPABILITY_GUIDED_SETUP] if self._envelope_guard.ready else []
 
     def start(self):
         """Subscribe to the config update topic."""
@@ -91,7 +109,36 @@ class RemoteConfigHandler:
 
     def _on_config_update(self, topic: str, payload: dict):
         """Handle an inbound config update message."""
-        request_id = payload.get("request_id", "unknown")
+        request_id = payload.get("request_id", "unknown") if isinstance(payload, dict) else "unknown"
+        signed_body = None
+        try:
+            if isinstance(payload, dict) and payload.get("schema_version") is not None:
+                signed_body, replay = self._envelope_guard.verify(payload)
+                request_id = signed_body["request_id"]
+                if replay:
+                    result = replay["result"]
+                    self._send_ack(
+                        request_id,
+                        status=result["config_update_status"],
+                        error=result.get("config_update_error"),
+                        connector_results=result.get("connector_results", []),
+                        rollback_connector_results=result.get(
+                            "rollback_connector_results",
+                            [],
+                        ),
+                        rollback_performed=result.get("rollback_performed", False),
+                        revision=signed_body.get("revision"),
+                        checksum=signed_body.get("checksum"),
+                        idempotency_key=signed_body.get("idempotency_key"),
+                        replayed=True,
+                    )
+                    return
+                payload = signed_body
+        except DeploymentSetupRejected as exc:
+            log.warning("Rejected guided config update (request_id=%s): %s", request_id, exc)
+            self._send_ack(request_id, status="failed", error=str(exc), error_code="config_rejected")
+            return
+
         action = payload.get("action", "full_update")
         new_config = payload.get("config")
 
@@ -100,6 +147,15 @@ class RemoteConfigHandler:
         try:
             if not new_config:
                 raise ValueError("Config update payload is missing 'config' field")
+
+            if signed_body:
+                self._send_ack(
+                    request_id,
+                    status="accepted",
+                    revision=signed_body.get("revision"),
+                    checksum=signed_body.get("checksum"),
+                    idempotency_key=signed_body.get("idempotency_key"),
+                )
 
             if action == "full_update":
                 result = self._apply_full_update(new_config)
@@ -112,12 +168,19 @@ class RemoteConfigHandler:
             else:
                 raise ValueError(f"Unknown config action: {action}")
 
+            if signed_body:
+                replay_result = redact_diagnostics(dict(result))
+                self._envelope_guard.record(signed_body, replay_result)
             self._send_ack(
                 request_id,
                 status=result["config_update_status"],
                 error=result.get("config_update_error"),
                 connector_results=result.get("connector_results", []),
+                rollback_connector_results=result.get("rollback_connector_results", []),
                 rollback_performed=result.get("rollback_performed", False),
+                revision=signed_body.get("revision") if signed_body else None,
+                checksum=signed_body.get("checksum") if signed_body else None,
+                idempotency_key=signed_body.get("idempotency_key") if signed_body else None,
             )
             if result["config_update_status"] == "success":
                 log.info("Config update applied successfully (request_id=%s)", request_id)
@@ -126,15 +189,28 @@ class RemoteConfigHandler:
                             result["config_update_status"], request_id)
 
         except Exception as e:
-            log.exception("Failed to apply config update (request_id=%s): %s", request_id, e)
+            safe_error = redact_text(str(e))
+            log.exception(
+                "Failed to apply config update (request_id=%s): %s",
+                request_id,
+                safe_error,
+            )
             self._last_update_status = {
                 "config_update_status": "failed",
-                "config_update_error": str(e),
+                "config_update_error": safe_error,
                 "rollback_performed": False,
                 "connector_results": [],
                 "config_version_ts": int(time() * 1000),
             }
-            self._send_ack(request_id, status="failed", error=str(e))
+            self._send_ack(
+                request_id,
+                status="failed",
+                error=safe_error,
+                error_code="config_apply_failed",
+                revision=signed_body.get("revision") if signed_body else None,
+                checksum=signed_body.get("checksum") if signed_body else None,
+                idempotency_key=signed_body.get("idempotency_key") if signed_body else None,
+            )
 
     def _apply_full_update(self, new_config: dict):
         """Replace the entire config.json and hot-reload all connectors."""
@@ -269,7 +345,7 @@ class RemoteConfigHandler:
                 self._gateway._connector_start_results = rollback_results
             status = {
                 "config_update_status": "rolled_back",
-                "config_update_error": error,
+                "config_update_error": redact_text(error),
                 "rollback_performed": True,
                 "connector_results": connector_results,
                 "rollback_connector_results": rollback_results,
@@ -277,7 +353,10 @@ class RemoteConfigHandler:
                 "action": action,
             }
             self._last_update_status = status
-            log.warning("Config update rolled back after connector failure: %s", error)
+            log.warning(
+                "Config update rolled back after connector failure: %s",
+                redact_text(error),
+            )
             return status
 
         self._write_last_known_good(new_config)
@@ -378,8 +457,21 @@ class RemoteConfigHandler:
             "last_known_good_path": self._last_known_good_path,
         }
 
-    def _send_ack(self, request_id: str, status: str, error: str = None,
-                  connector_results=None, rollback_performed: bool = False):
+    def _send_ack(
+        self,
+        request_id: str,
+        status: str,
+        error: str = None,
+        connector_results=None,
+        rollback_connector_results=None,
+        rollback_performed: bool = False,
+        *,
+        error_code: str = "",
+        revision=None,
+        checksum=None,
+        idempotency_key=None,
+        replayed: bool = False,
+    ):
         """Publish a config update acknowledgement as a gateway attribute."""
         version_ts = int(time() * 1000)
         payload = {
@@ -389,9 +481,15 @@ class RemoteConfigHandler:
                 "config_update_status": status,
                 "config_update_request_id": request_id,
                 "config_update_error": error,
+                "config_update_error_code": error_code,
                 "config_version_ts": version_ts,
                 "rollback_performed": rollback_performed,
                 "connector_results": connector_results or [],
+                "rollback_connector_results": rollback_connector_results or [],
+                "config_revision": revision,
+                "config_checksum": checksum,
+                "config_idempotency_key": idempotency_key,
+                "config_replayed": replayed,
             }
         }
-        self._publisher.publish_attributes(redact_secrets(payload))
+        self._publisher.publish_attributes(redact_diagnostics(payload))
