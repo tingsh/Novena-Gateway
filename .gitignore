@@ -1,30 +1,35 @@
-# Novena Gateway Git Ignore
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-.DS_Store
-.env
-venv/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
-.idea/
-.vscode/
+venv/
 .eggs/
 *.egg-info/
-node_modules/
-.mypy_cache/
-pytest_cache/
-# Local clones / vendors
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+
+# Local configuration, logs and vendors
+.env
+*.log
 thingsboard-gateway/
-# Build artifacts
+node_modules/
+
+# Build and release output
 dist/
 build/
 *.egg
 
-# Runtime state
-storage/sqlite/
-storage/update/*.tar.gz
+# Runtime state. Keep only directory placeholders in Git.
+storage/sqlite/*
+!storage/sqlite/.gitkeep
+storage/update/*
+!storage/update/.gitkeep
 config_backups/
 last_known_good_config.json
 *.db

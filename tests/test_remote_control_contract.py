@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -13,17 +14,30 @@ from novena_gateway.gateway.remote_control_protocol import (
 
 
 class RemoteControlContractTest(unittest.TestCase):
+    def _hub_fixture_path(self, gateway_root: Path) -> Path:
+        configured_root = os.environ.get("NOVENA_HUB_REPO")
+        candidates = [
+            Path(configured_root) if configured_root else None,
+            gateway_root.parent / "Novena-Hub",
+            gateway_root / "Novena-Hub",
+            gateway_root.parent / "remote-control-hub",
+        ]
+        for candidate in candidates:
+            if candidate:
+                fixture = candidate / "tests/fixtures/governed_command_v1.json"
+                if fixture.exists():
+                    return fixture
+        self.fail(
+            "Cross-repository Hub contract fixture is required; set NOVENA_HUB_REPO "
+            "or place Novena-Hub beside Novena-Gateway"
+        )
+
     def test_gateway_fixture_is_the_exact_hub_produced_contract_payload(self):
         gateway_root = Path(__file__).resolve().parents[1]
         gateway_fixture = json.loads(
             (gateway_root / "tests/fixtures/governed_command_v1.json").read_text()
         )
-        hub_fixture_path = (
-            gateway_root.parent
-            / "remote-control-hub"
-            / "tests/fixtures/governed_command_v1.json"
-        )
-        self.assertTrue(hub_fixture_path.exists(), "Cross-repository Hub contract fixture is required")
+        hub_fixture_path = self._hub_fixture_path(gateway_root)
         hub_fixture = json.loads(hub_fixture_path.read_text())
         self.assertEqual(gateway_fixture, hub_fixture)
         self.assertEqual(gateway_fixture["schema_version"], REMOTE_CONTROL_PROTOCOL_VERSION)

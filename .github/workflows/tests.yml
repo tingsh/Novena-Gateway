@@ -1,0 +1,39 @@
+name: Gateway Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out Hub contract fixture
+        uses: actions/checkout@v4
+        with:
+          repository: tingsh/Novena-Hub
+          path: Novena-Hub
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install appliance dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify dependencies and repository hygiene
+        run: |
+          python -m pip check
+          python scripts/check_repo_hygiene.py
+      - name: Compile Gateway
+        run: python -m compileall -q novena_gateway tests
+      - name: Validate local configuration
+        run: python -m novena_gateway.main --config config_local.json --validate-only
+      - name: Run complete Gateway suite
+        env:
+          NOVENA_HUB_REPO: ${{ github.workspace }}/Novena-Hub
+        run: python -m unittest discover -s tests -v
