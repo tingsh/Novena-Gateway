@@ -11,9 +11,18 @@ from Novena Hub. On receiving a new config:
 
 Inbound Config Payload Schema (cloud → edge):
 {
+    "schema_version": 1,
     "request_id": "uuid-string",
+    "idempotency_key": "unique-string",
+    "target": {"gateway_serial": "NF-EDGE-001"},
+    "revision": 1,
+    "checksum": "sha256",
+    "issued_at": "ISO-8601",
+    "expires_at": "ISO-8601",
     "action": "full_update" | "connector_update" | "connector_add" | "connector_remove",
-    "config": { ... }  // Full or partial config depending on action
+    "config": { ... },
+    "signing_key_id": "key-id",
+    "signature": "base64-ed25519"
 }
 
 Acknowledgement Attribute (edge → cloud):
@@ -111,29 +120,37 @@ class RemoteConfigHandler:
         """Handle an inbound config update message."""
         request_id = payload.get("request_id", "unknown") if isinstance(payload, dict) else "unknown"
         signed_body = None
+        if not isinstance(payload, dict) or payload.get("schema_version") is None:
+            log.warning("Rejected unsigned config update (request_id=%s)", request_id)
+            self._send_ack(
+                request_id,
+                status="failed",
+                error="This Gateway only accepts signed configuration envelopes.",
+                error_code="config_rejected",
+            )
+            return
         try:
-            if isinstance(payload, dict) and payload.get("schema_version") is not None:
-                signed_body, replay = self._envelope_guard.verify(payload)
-                request_id = signed_body["request_id"]
-                if replay:
-                    result = replay["result"]
-                    self._send_ack(
-                        request_id,
-                        status=result["config_update_status"],
-                        error=result.get("config_update_error"),
-                        connector_results=result.get("connector_results", []),
-                        rollback_connector_results=result.get(
-                            "rollback_connector_results",
-                            [],
-                        ),
-                        rollback_performed=result.get("rollback_performed", False),
-                        revision=signed_body.get("revision"),
-                        checksum=signed_body.get("checksum"),
-                        idempotency_key=signed_body.get("idempotency_key"),
-                        replayed=True,
-                    )
-                    return
-                payload = signed_body
+            signed_body, replay = self._envelope_guard.verify(payload)
+            request_id = signed_body["request_id"]
+            if replay:
+                result = replay["result"]
+                self._send_ack(
+                    request_id,
+                    status=result["config_update_status"],
+                    error=result.get("config_update_error"),
+                    connector_results=result.get("connector_results", []),
+                    rollback_connector_results=result.get(
+                        "rollback_connector_results",
+                        [],
+                    ),
+                    rollback_performed=result.get("rollback_performed", False),
+                    revision=signed_body.get("revision"),
+                    checksum=signed_body.get("checksum"),
+                    idempotency_key=signed_body.get("idempotency_key"),
+                    replayed=True,
+                )
+                return
+            payload = signed_body
         except DeploymentSetupRejected as exc:
             log.warning("Rejected guided config update (request_id=%s): %s", request_id, exc)
             self._send_ack(request_id, status="failed", error=str(exc), error_code="config_rejected")
@@ -148,14 +165,13 @@ class RemoteConfigHandler:
             if not new_config:
                 raise ValueError("Config update payload is missing 'config' field")
 
-            if signed_body:
-                self._send_ack(
-                    request_id,
-                    status="accepted",
-                    revision=signed_body.get("revision"),
-                    checksum=signed_body.get("checksum"),
-                    idempotency_key=signed_body.get("idempotency_key"),
-                )
+            self._send_ack(
+                request_id,
+                status="accepted",
+                revision=signed_body.get("revision"),
+                checksum=signed_body.get("checksum"),
+                idempotency_key=signed_body.get("idempotency_key"),
+            )
 
             if action == "full_update":
                 result = self._apply_full_update(new_config)
@@ -168,9 +184,8 @@ class RemoteConfigHandler:
             else:
                 raise ValueError(f"Unknown config action: {action}")
 
-            if signed_body:
-                replay_result = redact_diagnostics(dict(result))
-                self._envelope_guard.record(signed_body, replay_result)
+            replay_result = redact_diagnostics(dict(result))
+            self._envelope_guard.record(signed_body, replay_result)
             self._send_ack(
                 request_id,
                 status=result["config_update_status"],
@@ -178,9 +193,9 @@ class RemoteConfigHandler:
                 connector_results=result.get("connector_results", []),
                 rollback_connector_results=result.get("rollback_connector_results", []),
                 rollback_performed=result.get("rollback_performed", False),
-                revision=signed_body.get("revision") if signed_body else None,
-                checksum=signed_body.get("checksum") if signed_body else None,
-                idempotency_key=signed_body.get("idempotency_key") if signed_body else None,
+                revision=signed_body.get("revision"),
+                checksum=signed_body.get("checksum"),
+                idempotency_key=signed_body.get("idempotency_key"),
             )
             if result["config_update_status"] == "success":
                 log.info("Config update applied successfully (request_id=%s)", request_id)
@@ -207,9 +222,9 @@ class RemoteConfigHandler:
                 status="failed",
                 error=safe_error,
                 error_code="config_apply_failed",
-                revision=signed_body.get("revision") if signed_body else None,
-                checksum=signed_body.get("checksum") if signed_body else None,
-                idempotency_key=signed_body.get("idempotency_key") if signed_body else None,
+                revision=signed_body.get("revision"),
+                checksum=signed_body.get("checksum"),
+                idempotency_key=signed_body.get("idempotency_key"),
             )
 
     def _apply_full_update(self, new_config: dict):
