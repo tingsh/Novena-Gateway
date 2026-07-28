@@ -132,7 +132,7 @@ class SignedConfigEnvelopeTest(unittest.TestCase):
         self.assertEqual(wrong["config_update_status"], "failed")
         self.assertIn("different Gateway", wrong["config_update_error"])
 
-    def test_legacy_payload_remains_supported(self):
+    def test_unsigned_payload_is_rejected_without_applying(self):
         self.handler._on_config_update(
             "topic",
             {
@@ -142,7 +142,9 @@ class SignedConfigEnvelopeTest(unittest.TestCase):
             },
         )
         last = self.publisher.publish_attributes.call_args.args[0]["attributes"]
-        self.assertEqual(last["config_update_status"], "success")
+        self.assertEqual(last["config_update_status"], "failed")
+        self.assertEqual(last["config_update_error_code"], "config_rejected")
+        self.assertEqual(self.gateway.start_count, 0)
 
 
 class SafeDiscoveryTargetTest(unittest.TestCase):

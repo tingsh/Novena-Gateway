@@ -157,8 +157,8 @@ class TestRemoteConfigHandler(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.handler._apply_connector_remove({"name": "Ghost Conn"})
 
-    def test_on_config_update_sends_ack(self):
-        """Config update should publish acknowledgement attribute."""
+    def test_unsigned_config_update_is_rejected(self):
+        """Remote config never falls back to an unsigned payload."""
         self.handler._on_config_update("test/topic", {
             "request_id": "req-001",
             "action": "full_update",
@@ -171,8 +171,9 @@ class TestRemoteConfigHandler(unittest.TestCase):
 
         self.mock_publisher.publish_attributes.assert_called()
         payload = self.mock_publisher.publish_attributes.call_args[0][0]
-        self.assertEqual(payload["attributes"]["config_update_status"], "success")
+        self.assertEqual(payload["attributes"]["config_update_status"], "failed")
         self.assertEqual(payload["attributes"]["config_update_request_id"], "req-001")
+        self.assertEqual(payload["attributes"]["config_update_error_code"], "config_rejected")
         self.assertFalse(payload["attributes"]["rollback_performed"])
         self.assertIn("connector_results", payload["attributes"])
 
@@ -197,28 +198,25 @@ class TestRemoteConfigHandler(unittest.TestCase):
             config={"enabled": True, "backup_dir": self.backup_dir}
         )
 
-        handler._on_config_update("test/topic", {
-            "request_id": "req-rollback",
-            "action": "full_update",
-            "config": {
+        result = handler._apply_full_update(
+            {
                 "gateway": {"serial_number": "NF-BAD"},
                 "mqtt": {"host": "localhost", "port": 1883},
                 "connectors": [
                     {"type": "modbus", "name": "Broken Modbus", "config": {}}
-                ]
+                ],
             }
-        })
+        )
 
         with open(self.config_path) as f:
             written = json.load(f)
         self.assertEqual(written["gateway"]["serial_number"], "NF-TEST")
 
-        payload = self.mock_publisher.publish_attributes.call_args[0][0]
-        self.assertEqual(payload["attributes"]["config_update_status"], "rolled_back")
-        self.assertTrue(payload["attributes"]["rollback_performed"])
-        self.assertEqual(payload["attributes"]["connector_results"][0]["status"], "error")
+        self.assertEqual(result["config_update_status"], "rolled_back")
+        self.assertTrue(result["rollback_performed"])
+        self.assertEqual(result["connector_results"][0]["status"], "error")
         self.assertEqual(
-            payload["attributes"]["rollback_connector_results"][0]["status"],
+            result["rollback_connector_results"][0]["status"],
             "error",
         )
 

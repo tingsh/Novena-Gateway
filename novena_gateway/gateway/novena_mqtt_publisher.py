@@ -569,9 +569,21 @@ class NovenaMqttPublisher:
             request_id = payload.get("request_id")
             if not new_password:
                 log.error("Provision %s: missing password", action)
-                self._publish_credential_ack(action, request_id, "failed", "missing password")
+                self._publish_credential_ack(
+                    action,
+                    request_id,
+                    "failed",
+                    "missing password",
+                    generation=payload.get("generation"),
+                )
                 return
-            self._rotate_password(new_password, new_username, request_id=request_id, action=action)
+            self._rotate_password(
+                new_password,
+                new_username,
+                request_id=request_id,
+                action=action,
+                generation=payload.get("generation"),
+            )
         else:
             log.warning("Unknown provision action: %s", action)
 
@@ -581,6 +593,7 @@ class NovenaMqttPublisher:
         new_username: str = None,
         request_id: str = None,
         action: str = "rotate_password",
+        generation=None,
     ):
         """
         Rotate MQTT credentials:
@@ -606,7 +619,7 @@ class NovenaMqttPublisher:
                 log.info("Updated config.json with new MQTT password")
             except Exception as e:
                 log.error("Failed to update config.json during password rotation: %s", e)
-                self._publish_credential_ack(action, request_id, "failed", str(e))
+                self._publish_credential_ack(action, request_id, "failed", str(e), generation=generation)
                 return
 
         # 2. Update in-memory password
@@ -617,18 +630,28 @@ class NovenaMqttPublisher:
         if hasattr(self, "_client"):
             self._client.username_pw_set(self._username, self._password)
 
-        self._publish_credential_ack(action, request_id, "success")
+        self._publish_credential_ack(action, request_id, "success", generation=generation)
 
         # 3. Disconnect (paho will auto-reconnect with the new credentials)
         log.info("Disconnecting to apply new credentials...")
         self._reconnect_with_current_credentials()
 
-    def _publish_credential_ack(self, action: str, request_id: str = None, status: str = "success", error: str = ""):
+    def _publish_credential_ack(
+        self,
+        action: str,
+        request_id: str = None,
+        status: str = "success",
+        error: str = "",
+        *,
+        generation=None,
+    ):
         attributes = {
             "credential_update_status": status,
             "credential_update_action": action,
             "credential_update_request_id": request_id,
         }
+        if generation is not None:
+            attributes["credential_update_generation"] = generation
         if error:
             attributes["credential_update_error"] = error
         ack = {
