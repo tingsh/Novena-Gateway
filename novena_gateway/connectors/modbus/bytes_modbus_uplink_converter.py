@@ -229,6 +229,8 @@ class BytesModbusUplinkConverter(ModbusConverter):
                 decoded_data = float(decoded_data) / float(config['divider'])
             elif config.get('multiplier'):
                 decoded_data = decoded_data * config['multiplier']
+            if config.get('offset') is not None:
+                decoded_data = decoded_data + config['offset']
 
         if self._is_enum_value(config):
             decoded_data = self._process_enum_value(config, decoded_data)

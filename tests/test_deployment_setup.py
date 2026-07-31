@@ -13,7 +13,9 @@ from unittest.mock import MagicMock, patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pymodbus.constants import Endian
 
+from novena_gateway.connectors.modbus.bytes_modbus_uplink_converter import BytesModbusUplinkConverter
 from novena_gateway.gateway.deployment_setup import canonical_bytes, checksum
 from novena_gateway.gateway.discovery_service import DiscoveryService
 from novena_gateway.gateway.governed_commands import (
@@ -206,6 +208,49 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
                 {"data_type": "uint16", "quality": {"max": 500}},
                 {},
             )
+
+        with self.assertRaisesRegex(ValueError, "expected range"):
+            self.service._decode_validation_value(
+                [9000],
+                {"data_type": "uint16", "unit": "°C"},
+                {},
+            )
+
+    @patch("pymodbus.client.ModbusTcpClient")
+    def test_connection_only_validation_does_not_read_registers(self, client_class):
+        client = client_class.return_value
+        client.connect.return_value = True
+
+        result = self.service.validate_modbus(
+            {
+                "protocol": "modbus_tcp",
+                "connection": {"host": "192.168.1.50", "port": 502, "slave_id": 1},
+                "connection_only": True,
+            }
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["mode"], "connection")
+        client.read_holding_registers.assert_not_called()
+        client.close.assert_called_once()
+
+    def test_deployed_modbus_conversion_applies_multiplier_then_offset(self):
+        converter = object.__new__(BytesModbusUplinkConverter)
+
+        value = converter.decode_data(
+            [100],
+            {
+                "functionCode": 3,
+                "type": "16uint",
+                "objectsCount": 1,
+                "multiplier": 0.1,
+                "offset": -5,
+            },
+            Endian.BIG,
+            Endian.BIG,
+        )
+
+        self.assertEqual(value, 5)
 
 
 class SignedDeploymentDiagnosticTest(unittest.TestCase):
