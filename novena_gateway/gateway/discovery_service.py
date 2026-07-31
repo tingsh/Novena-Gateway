@@ -514,9 +514,11 @@ class DiscoveryService:
         protocol = params.get("protocol")
         connection = params.get("connection") or {}
         datapoints = params.get("datapoints") or []
+        connection_only = bool(params.get("connection_only"))
+        mapping_checksum = str(params.get("mapping_checksum") or "")
         if protocol not in {"modbus_tcp", "modbus_rtu"}:
             raise ValueError("Only Modbus TCP and Modbus RTU validation are supported")
-        if not isinstance(datapoints, list) or not datapoints:
+        if not connection_only and (not isinstance(datapoints, list) or not datapoints):
             raise ValueError("At least one datapoint is required for validation")
         if len(datapoints) > 20:
             raise ValueError("Validation is limited to 20 datapoints")
@@ -552,6 +554,14 @@ class DiscoveryService:
         try:
             if not client.connect():
                 raise ConnectionError("The Gateway could not connect to this equipment")
+            if connection_only:
+                return {
+                    "status": "success",
+                    "mode": "connection",
+                    "message": "The Gateway reached the equipment connection endpoint.",
+                    "signals": [],
+                    "retryable": True,
+                }
             for datapoint in datapoints:
                 address = int(datapoint.get("address", 0))
                 count = int(datapoint.get("objectsCount", 1))
@@ -607,6 +617,8 @@ class DiscoveryService:
         successful = [item for item in results if item["status"] == "success"]
         return {
             "status": "success" if len(successful) == len(results) else ("partial" if successful else "failed"),
+            "mode": "datapoints",
+            "mapping_checksum": mapping_checksum,
             "message": (
                 f"{len(successful)} of {len(results)} selected signals were read successfully."
                 if successful
@@ -630,6 +642,9 @@ class DiscoveryService:
                 "uint32": (2, ">I"),
                 "int32": (2, ">i"),
                 "float32": (2, ">f"),
+                "uint64": (4, ">Q"),
+                "int64": (4, ">q"),
+                "float64": (4, ">d"),
             }
             required, fmt = formats.get(data_type, (None, None))
             if required is None:
@@ -655,6 +670,12 @@ class DiscoveryService:
         quality = datapoint.get("quality") or {}
         minimum = quality.get("min", datapoint.get("min"))
         maximum = quality.get("max", datapoint.get("max"))
+        unit = str(datapoint.get("unit") or "").strip().lower()
+        if minimum is None and maximum is None:
+            if unit in {"°c", "degc", "celsius"}:
+                minimum, maximum = -100, 500
+            elif unit in {"%", "%rh", "percent"}:
+                minimum, maximum = 0, 100
         if minimum is not None and float(decoded) < float(minimum):
             raise ValueError("Decoded value is below the expected range")
         if maximum is not None and float(decoded) > float(maximum):

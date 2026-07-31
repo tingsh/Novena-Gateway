@@ -39,6 +39,26 @@ with at most 64 targets per request. It does not infer or sweep a subnet. Modbus
 uses explicit or locally enumerated serial interfaces and bounded common settings.
 Scans are rate-limited, cancellable, and report partial progress.
 
+## PLC signal validation
+
+For a programmable PLC or generic I/O device, the Hub supplies a site-specific
+mapping in a signed `deployment_validate` command. A connection-only check opens
+the selected Modbus endpoint without reading registers. A datapoint check performs
+only function-code 1, 2, 3, or 4 reads, with a maximum of 20 signals and four
+objects per signal.
+
+The Gateway decodes byte order, word order, data type, multiplier, and offset before
+returning the typed value and sampled raw objects to the Hub. It also rejects
+non-finite values and readings outside configured safety bounds. Conservative
+defaults flag Celsius values outside -100 to 500 and percentage values outside
+0 to 100 when the installer has not supplied bounds.
+
+The returned mapping checksum identifies the exact signed request that was tested.
+The Hub requires every signal to succeed and requires a user to confirm those
+decoded readings before that mapping is eligible for connector configuration.
+Changing the connection or mapping invalidates the evidence and requires another
+test. This validation path never writes to field equipment.
+
 ## Activation and rollback
 
 For a signed configuration, the Gateway verifies the target serial, expiry,
