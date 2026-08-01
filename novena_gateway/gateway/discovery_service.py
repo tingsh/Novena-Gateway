@@ -515,6 +515,7 @@ class DiscoveryService:
         connection = params.get("connection") or {}
         datapoints = params.get("datapoints") or []
         connection_only = bool(params.get("connection_only"))
+        validation_profile = str(params.get("validation_profile") or "fixed")
         mapping_checksum = str(params.get("mapping_checksum") or "")
         if protocol not in {"modbus_tcp", "modbus_rtu"}:
             raise ValueError("Only Modbus TCP and Modbus RTU validation are supported")
@@ -580,7 +581,14 @@ class DiscoveryService:
                     raise ValueError("Validation supports read-only Modbus function codes 1, 2, 3, and 4")
                 if not response or response.isError():
                     results.append(
-                        {"key": datapoint.get("key", f"register_{address}"), "status": "failed", "address": address}
+                        {
+                            "key": datapoint.get("key", f"register_{address}"),
+                            "status": "failed",
+                            "address": address,
+                            "error_message": "The equipment did not return a readable value",
+                            "reason": "The equipment did not return a readable value",
+                            "blocking": True,
+                        }
                     )
                     continue
                 value = getattr(response, "registers", None) or getattr(response, "bits", None) or []
@@ -597,33 +605,67 @@ class DiscoveryService:
                             "key": datapoint.get("key", f"register_{address}"),
                             "status": "failed",
                             "address": address,
+                            "error_message": str(exc),
                             "reason": str(exc),
+                            "blocking": True,
                         }
                     )
                     continue
+                try:
+                    warning_message, blocking = self._validation_value_assessment(
+                        decoded,
+                        datapoint,
+                        validation_profile=validation_profile,
+                    )
+                except (TypeError, ValueError) as exc:
+                    results.append(
+                        {
+                            "key": datapoint.get("key", f"register_{address}"),
+                            "status": "failed",
+                            "address": address,
+                            "sample": list(value[:count]),
+                            "raw_value": list(value[:count]),
+                            "value": decoded,
+                            "decoded_value": decoded,
+                            "error_message": f"Validation limits are invalid: {exc}",
+                            "reason": f"Validation limits are invalid: {exc}",
+                            "blocking": True,
+                        }
+                    )
+                    continue
+                signal_status = "failed" if blocking else ("warning" if warning_message else "success")
                 results.append(
                     {
                         "key": datapoint.get("key", f"register_{address}"),
-                        "status": "success",
+                        "status": signal_status,
                         "address": address,
                         "sample": list(value[:count]),
+                        "raw_value": list(value[:count]),
                         "value": decoded,
+                        "decoded_value": decoded,
                         "unit": str(datapoint.get("unit") or ""),
+                        "warning_message": warning_message or "",
+                        "reason": warning_message if blocking else "",
+                        "blocking": blocking,
                     }
                 )
         finally:
             client.close()
 
-        successful = [item for item in results if item["status"] == "success"]
+        readable = [item for item in results if item["status"] in {"success", "warning"}]
+        warnings = [item for item in results if item["status"] == "warning"]
         return {
-            "status": "success" if len(successful) == len(results) else ("partial" if successful else "failed"),
+            "status": "success" if len(readable) == len(results) else ("partial" if readable else "failed"),
             "mode": "datapoints",
             "mapping_checksum": mapping_checksum,
             "message": (
-                f"{len(successful)} of {len(results)} selected signals were read successfully."
-                if successful
+                f"All {len(results)} selected signals were read; {len(warnings)} need review."
+                if len(readable) == len(results) and warnings
+                else f"{len(readable)} of {len(results)} selected signals were read successfully."
+                if readable
                 else "The Gateway connected, but could not read the selected signals."
             ),
+            "warning_count": len(warnings),
             "signals": results,
             "retryable": True,
         }
@@ -667,20 +709,67 @@ class DiscoveryService:
             if isinstance(decoded, float) and not math.isfinite(decoded):
                 raise ValueError("Decoded value is not finite; check data type and byte order")
 
-        quality = datapoint.get("quality") or {}
-        minimum = quality.get("min", datapoint.get("min"))
-        maximum = quality.get("max", datapoint.get("max"))
-        unit = str(datapoint.get("unit") or "").strip().lower()
-        if minimum is None and maximum is None:
-            if unit in {"°c", "degc", "celsius"}:
-                minimum, maximum = -100, 500
-            elif unit in {"%", "%rh", "percent"}:
-                minimum, maximum = 0, 100
-        if minimum is not None and float(decoded) < float(minimum):
-            raise ValueError("Decoded value is below the expected range")
-        if maximum is not None and float(decoded) > float(maximum):
-            raise ValueError("Decoded value is above the expected range")
         return decoded
+
+    @staticmethod
+    def _validation_value_assessment(decoded, datapoint, *, validation_profile="fixed"):
+        """Return an explainable warning and whether it must block confirmation."""
+        value = float(decoded)
+        quality = datapoint.get("quality") or {}
+        safety_min = quality.get("min", datapoint.get("min"))
+        safety_max = quality.get("max", datapoint.get("max"))
+        unit = str(datapoint.get("unit") or "").strip().lower()
+
+        if safety_min is not None and value < float(safety_min):
+            return f"Decoded value {decoded} is below the configured safety minimum {safety_min}.", True
+        if safety_max is not None and value > float(safety_max):
+            return f"Decoded value {decoded} is above the configured safety maximum {safety_max}.", True
+
+        if validation_profile != "site_defined":
+            if unit in {"°c", "degc", "celsius"} and not -100 <= value <= 500:
+                return "Decoded value is outside the expected temperature range.", True
+            if unit in {"%", "%rh", "percent"} and not 0 <= value <= 100:
+                return "Decoded value is outside the expected percentage range.", True
+            return "", False
+
+        semantic = " ".join(
+            [str(datapoint.get("key") or ""), str(datapoint.get("label") or "")]
+        ).lower().replace("_", " ")
+        hard_range = None
+        range_label = ""
+        if (
+            unit in {"%", "%rh", "percent", "pct"}
+            or "humidity" in semantic
+            or "percent" in semantic
+            or "percentage" in semantic
+        ):
+            hard_range, range_label = (0, 100), "percentage or humidity"
+        elif "power factor" in semantic or "pf" in semantic.split():
+            hard_range, range_label = (-1, 1), "power factor"
+        elif unit in {"°c", "degc", "celsius"}:
+            hard_range, range_label = (-273.15, 2000), "Celsius temperature"
+        elif unit in {"°f", "degf", "fahrenheit"}:
+            hard_range, range_label = (-459.67, 3632), "Fahrenheit temperature"
+        elif unit in {"k", "kelvin"} and "temp" in semantic:
+            hard_range, range_label = (0, 2273.15), "Kelvin temperature"
+        elif value < 0 and "pressure" in semantic and ("absolute" in semantic or "abs pressure" in semantic):
+            return "Absolute pressure cannot be negative; check the address, data type, and scaling.", True
+
+        if hard_range and not hard_range[0] <= value <= hard_range[1]:
+            return (
+                f"Decoded value {decoded} is outside the physically plausible {range_label} range "
+                f"({hard_range[0]} to {hard_range[1]}).",
+                True,
+            )
+
+        normal = datapoint.get("normal") or {}
+        normal_min = normal.get("min")
+        normal_max = normal.get("max")
+        if normal_min is not None and value < float(normal_min):
+            return f"Decoded value {decoded} is below the configured normal minimum {normal_min}.", False
+        if normal_max is not None and value > float(normal_max):
+            return f"Decoded value {decoded} is above the configured normal maximum {normal_max}.", False
+        return "", False
 
     # ─── Helpers ──────────────────────────────────────────────────────
 
