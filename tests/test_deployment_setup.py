@@ -185,7 +185,7 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         )
         self.assertTrue(callable(scan_tcp.call_args.kwargs["progress_callback"]))
 
-    def test_validation_decodes_type_scale_and_plausibility(self):
+    def test_validation_decodes_type_scale_and_assesses_plausibility(self):
         encoded = struct.pack(">f", 230.5)
         words = [
             int.from_bytes(encoded[0:2], byteorder="big"),
@@ -202,19 +202,92 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         )
         self.assertAlmostEqual(value, 230.5)
 
-        with self.assertRaisesRegex(ValueError, "expected range"):
-            self.service._decode_validation_value(
-                [1000],
-                {"data_type": "uint16", "quality": {"max": 500}},
-                {},
-            )
+        warning, blocking = self.service._validation_value_assessment(
+            1000,
+            {"quality": {"max": 500}},
+            validation_profile="site_defined",
+        )
+        self.assertTrue(blocking)
+        self.assertIn("safety maximum", warning)
 
-        with self.assertRaisesRegex(ValueError, "expected range"):
-            self.service._decode_validation_value(
-                [9000],
-                {"data_type": "uint16", "unit": "°C"},
-                {},
-            )
+        warning, blocking = self.service._validation_value_assessment(
+            9000,
+            {"key": "temperature", "unit": "°C"},
+            validation_profile="site_defined",
+        )
+        self.assertTrue(blocking)
+        self.assertIn("physically plausible", warning)
+
+    def test_site_defined_impossible_values_and_normal_warnings(self):
+        cases = [
+            (101, {"key": "humidity", "unit": "%"}),
+            (1.2, {"key": "power_factor"}),
+            (-1, {"key": "absolute_pressure", "unit": "bar"}),
+        ]
+        for value, datapoint in cases:
+            with self.subTest(value=value, datapoint=datapoint):
+                warning, blocking = self.service._validation_value_assessment(
+                    value,
+                    datapoint,
+                    validation_profile="site_defined",
+                )
+                self.assertTrue(blocking)
+                self.assertTrue(warning)
+
+        warning, blocking = self.service._validation_value_assessment(
+            85,
+            {"key": "temperature", "unit": "°C", "normal": {"min": 20, "max": 80}},
+            validation_profile="site_defined",
+        )
+        self.assertFalse(blocking)
+        self.assertIn("normal maximum", warning)
+
+        warning, blocking = self.service._validation_value_assessment(
+            -0.5,
+            {"key": "gauge_pressure", "unit": "bar"},
+            validation_profile="site_defined",
+        )
+        self.assertFalse(blocking)
+        self.assertFalse(warning)
+
+    @patch("pymodbus.client.ModbusTcpClient")
+    def test_advisory_signal_warning_preserves_raw_and_decoded_values(self, client_class):
+        client = client_class.return_value
+        client.connect.return_value = True
+        response = MagicMock()
+        response.isError.return_value = False
+        response.registers = [85]
+        response.bits = None
+        client.read_holding_registers.return_value = response
+
+        result = self.service.validate_modbus(
+            {
+                "protocol": "modbus_tcp",
+                "connection": {"host": "192.168.1.50", "port": 502, "slave_id": 1},
+                "validation_profile": "site_defined",
+                "mapping_checksum": "map-checksum",
+                "datapoints": [
+                    {
+                        "key": "temperature",
+                        "address": 10,
+                        "functionCode": 3,
+                        "objectsCount": 1,
+                        "data_type": "uint16",
+                        "unit": "°C",
+                        "normal": {"max": 80},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["warning_count"], 1)
+        signal = result["signals"][0]
+        self.assertEqual(signal["status"], "warning")
+        self.assertEqual(signal["raw_value"], [85])
+        self.assertEqual(signal["decoded_value"], 85)
+        self.assertFalse(signal["blocking"])
+        self.assertIn("normal maximum", signal["warning_message"])
 
     @patch("pymodbus.client.ModbusTcpClient")
     def test_connection_only_validation_does_not_read_registers(self, client_class):
