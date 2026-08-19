@@ -15,6 +15,7 @@ import asyncio
 import threading
 import time
 import unittest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,7 @@ from pymodbus.datastore import (
 from pymodbus.server import StartTcpServer
 
 from novena_gateway.gateway.payload_formatter import PayloadFormatter
+from novena_gateway.gateway.discovery_service import DiscoveryService
 from novena_gateway.gateway.entities.converted_data import ConvertedData
 from novena_gateway.gateway.entities.datapoint_key import DatapointKey
 from novena_gateway.gateway.entities.telemetry_entry import TelemetryEntry
@@ -155,6 +157,27 @@ class TestModbusIntegration(unittest.TestCase):
         print("\n[SUCCESS] Integration test passed!")
         print(f"   Modbus simulator -> ConvertedData -> Novena payload")
         print(f"   Payload: {payload}")
+
+    def test_discovery_probe_uses_pinned_pymodbus_api(self):
+        service = DiscoveryService(
+            gateway=MagicMock(_config={"connectors": []}),
+            publisher=MagicMock(),
+            serial_number="NF-DISCOVERY-TEST",
+            config={"enabled": True, "tcp_scan_timeout_ms": 500},
+        )
+
+        from pymodbus.client import ModbusTcpClient
+
+        device = service._probe_tcp_target(
+            ModbusTcpClient,
+            self.SERVER_HOST,
+            self.SERVER_PORT,
+            0.5,
+        )
+
+        self.assertIsNotNone(device)
+        self.assertEqual(device["interface"], f"{self.SERVER_HOST}:{self.SERVER_PORT}")
+        self.assertEqual(device["connection"], "modbus_tcp")
 
 
 if __name__ == "__main__":

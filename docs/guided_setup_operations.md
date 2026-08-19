@@ -34,10 +34,38 @@ replacing a newer one.
 
 ## Discovery safety
 
-Guided Modbus TCP discovery accepts only explicit unicast IP addresses and ports,
-with at most 64 targets per request. It does not infer or sweep a subnet. Modbus RTU
-uses explicit or locally enumerated serial interfaces and bounded common settings.
-Scans are rate-limited, cancellable, and report partial progress.
+Discovery, device health, and telemetry polling are separate operations:
+
+- discovery looks for unknown connected equipment;
+- health checks assess equipment that is already configured; and
+- telemetry polling reads configured equipment on its normal connector schedule.
+
+Hub starts discovery with a signed `deployment_discover` diagnostic command carrying
+a UUID `scan_id` and `scope: "attached_interfaces"`. The legacy `scan_devices` method
+is a signed compatibility alias. The Gateway verifies the normal Ed25519 diagnostic
+envelope, target serial, trusted clock, issuance/expiry, request identity, and key
+trust before starting either name. Duplicate terminal `scan_id` values replay their
+cached result, the active `scan_id` is idempotent, a different concurrent scan is
+rejected, and cancellation must name the active scan.
+
+An attached-interface scan enumerates native UART and USB serial adapters for bounded
+Modbus RTU probing. It also scans TCP port 502 across no more than the directly
+attached private `/24` window for each eligible physical IPv4 interface. Loopback,
+container/virtual, public, link-local, and cellular WAN interfaces are excluded, and
+a subnet smaller than `/24` is not expanded. Configured TCP endpoints and configured
+serial interfaces are reported as skipped so discovery cannot interrupt connector
+health checks or telemetry polling. Generic USB and CAN interfaces are inventoried,
+but protocol-specific automatic identification is not supported in this version.
+
+Reports use `v1/gateway/{serial}/attributes` and include schema version, `scan_id`,
+status, phase, counters, checked interfaces, unknown devices, skipped configured
+interfaces, errors, and timestamps. The Gateway emits an initial `running` report,
+incremental progress, and one terminal `complete`, `cancelled`, or `error` report.
+
+Background scanning is off by default (`scan_on_boot: false` and
+`scan_interval_seconds: 0`). Signed on-demand discovery remains available whenever
+the discovery service is enabled. Sites that deliberately need a low-frequency
+background inventory can opt in explicitly; onboarding must not depend on it.
 
 ## PLC signal validation
 

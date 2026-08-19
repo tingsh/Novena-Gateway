@@ -170,6 +170,101 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service._approved_tcp_targets(["192.168.1.50:70000"])
 
+    def test_on_demand_is_enabled_without_background_threads_by_default(self):
+        self.service.start()
+        self.assertIsNone(self.service._scan_thread)
+        self.assertIsNone(self.service._periodic_thread)
+
+    @patch("novena_gateway.gateway.discovery_service.os.path.exists", return_value=True)
+    @patch("novena_gateway.gateway.discovery_service.subprocess.check_output")
+    def test_attached_network_scan_is_private_physical_and_bounded(self, check_output, _exists):
+        check_output.return_value = json.dumps(
+            [
+                {"ifname": "eth0", "addr_info": [{"family": "inet", "local": "10.0.0.10", "prefixlen": 16}]},
+                {"ifname": "docker0", "addr_info": [{"family": "inet", "local": "172.17.0.1", "prefixlen": 16}]},
+                {"ifname": "eth1", "addr_info": [{"family": "inet", "local": "8.8.8.8", "prefixlen": 24}]},
+                {"ifname": "wwan0", "addr_info": [{"family": "inet", "local": "10.20.30.40", "prefixlen": 24}]},
+            ]
+        )
+
+        interfaces = self.service._enumerate_private_network_interfaces()
+        targets = self.service._targets_for_network_interfaces(interfaces)
+
+        self.assertEqual([item["name"] for item in interfaces], ["eth0"])
+        self.assertEqual(len(targets), 253)
+        self.assertIn(("10.0.0.20", 502), targets)
+        self.assertNotIn(("10.0.0.10", 502), targets)
+
+    def test_attached_network_scan_does_not_escape_smaller_subnet(self):
+        targets = self.service._targets_for_network_interfaces(
+            [{"name": "eth0", "address": "10.0.0.9", "prefixlen": 30}]
+        )
+
+        self.assertEqual(targets, [("10.0.0.10", 502)])
+
+    def test_duplicate_terminal_scan_republishes_without_restarting(self):
+        report = {"scan_id": "scan-1", "status": "complete", "discovered_devices": []}
+        self.service._reports_by_scan_id["scan-1"] = report
+
+        result = self.service.start_guided_scan({"scan_id": "scan-1", "scope": "attached_interfaces"})
+
+        self.assertEqual(result["status"], "replayed")
+        self.service._publisher.publish_attributes.assert_called_once()
+
+    def test_cancel_must_match_active_scan(self):
+        self.service._active_scan_id = "scan-1"
+        with self.assertRaisesRegex(ValueError, "not active"):
+            self.service.cancel_current_scan("scan-2")
+
+    def test_duplicate_active_scan_is_idempotent_and_concurrent_scan_is_rejected(self):
+        self.service._active_scan_id = "scan-1"
+        self.service._scan_lock.acquire()
+        try:
+            duplicate = self.service.start_guided_scan({"scan_id": "scan-1"})
+            self.assertEqual(duplicate["status"], "running")
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                self.service.start_guided_scan({"scan_id": "scan-2"})
+        finally:
+            self.service._scan_lock.release()
+
+    @patch.object(DiscoveryService, "_inventory_non_modbus_interfaces", return_value=[])
+    @patch.object(DiscoveryService, "_enumerate_serial_ports", return_value=[])
+    @patch.object(DiscoveryService, "_targets_for_network_interfaces")
+    @patch.object(DiscoveryService, "_enumerate_private_network_interfaces")
+    @patch.object(DiscoveryService, "_scan_tcp_network", return_value=[])
+    def test_configured_tcp_endpoint_is_skipped_without_polling(
+        self, scan_tcp, enumerate_network, network_targets, _serial, _inventory
+    ):
+        service = DiscoveryService(
+            gateway=MagicMock(
+                _config={
+                    "connectors": [
+                        {
+                            "config": {
+                                "master": {
+                                    "slaves": [
+                                        {"type": "tcp", "host": "10.0.0.20", "port": 502}
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            ),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={"enabled": True},
+        )
+        enumerate_network.return_value = [{"name": "eth0", "address": "10.0.0.10", "prefixlen": 24}]
+        network_targets.return_value = [("10.0.0.20", 502), ("10.0.0.21", 502)]
+
+        report = service.scan(options={"scan_id": "scan-1", "scope": "attached_interfaces"})
+
+        self.assertEqual(scan_tcp.call_args.kwargs["approved_targets"], [("10.0.0.21", 502)])
+        self.assertEqual(report["skipped_configured"][0]["interface"], "10.0.0.20:502")
+        self.assertEqual(report["status"], "complete")
+        self.assertIn("completed_at", report)
+
     @patch.object(DiscoveryService, "_enumerate_serial_ports", return_value=[])
     @patch.object(DiscoveryService, "_scan_tcp_network", return_value=[])
     def test_guided_scan_passes_only_approved_targets(self, scan_tcp, _serial):
@@ -350,7 +445,7 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def envelope(self):
+    def envelope(self, *, method="deployment_preflight", expires_at=None):
         now = datetime.now(timezone.utc)
         body = {
             "schema_version": 1,
@@ -358,7 +453,7 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
             "command_id": "diagnostic-command",
             "idempotency_key": "diagnostic-once",
             "target": {"gateway_serial": "NF-GUIDED", "device_id": None},
-            "method": "deployment_preflight",
+            "method": method,
             "params": {},
             "risk": "diagnostic",
             "control_epoch": 0,
@@ -366,7 +461,7 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
             "revisions": {"template": 0, "commissioning": 0, "policy": 0},
             "policy_checksum": "",
             "issued_at": now.isoformat(),
-            "expires_at": (now + timedelta(minutes=2)).isoformat(),
+            "expires_at": (expires_at or (now + timedelta(minutes=2))).isoformat(),
         }
         return {
             **body,
@@ -385,6 +480,24 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
         envelope["target"]["gateway_serial"] = "NF-OTHER"
         with self.assertRaises(GovernedCommandRejected):
             self.guard.validate_diagnostic(envelope)
+
+    def test_discovery_and_legacy_alias_require_a_valid_unexpired_signature(self):
+        for method in ("deployment_discover", "scan_devices"):
+            with self.subTest(method=method):
+                verified = self.guard.validate_diagnostic(self.envelope(method=method))
+                self.assertEqual(verified["method"], method)
+
+        unsigned = self.envelope(method="deployment_discover")
+        unsigned.pop("signature")
+        with self.assertRaises(GovernedCommandRejected):
+            self.guard.validate_diagnostic(unsigned)
+
+        expired = self.envelope(
+            method="deployment_discover",
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        with self.assertRaisesRegex(GovernedCommandRejected, "expired"):
+            self.guard.validate_diagnostic(expired)
 
     def test_diagnostic_evidence_redacts_nested_inline_credentials(self):
         redacted = redact_diagnostics(

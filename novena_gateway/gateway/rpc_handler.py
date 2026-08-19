@@ -73,6 +73,7 @@ STATE_CHANGING_COMMANDS = {
     "update_firmware",
 }
 SIGNED_DEPLOYMENT_DIAGNOSTICS = {
+    "scan_devices",
     "deployment_preflight",
     "deployment_discover",
     "deployment_validate",
@@ -777,26 +778,8 @@ class RpcHandler:
         return result
 
     def _cmd_scan_devices(self, params: dict) -> dict:
-        """
-        Trigger a device discovery scan.
-
-        params: {
-            "scan_type": "manual",     // optional: "manual" or "boot"
-            "slave_range": [1, 32]     // optional: override default slave range
-        }
-        """
-        discovery = getattr(self._gateway, "_discovery_service", None)
-        if not discovery:
-            raise ValueError("Discovery service is not available on this gateway")
-
-        scan_type = params.get("scan_type", "manual")
-        report = discovery.scan(scan_type=scan_type)
-
-        return {
-            "devices_found": len(report.get("discovered_devices", [])),
-            "interfaces_scanned": len(report.get("interfaces", [])),
-            "scan_ts": report.get("scan_ts"),
-        }
+        """Backward-compatible signed alias for on-demand discovery."""
+        return self._cmd_deployment_discover(params)
 
     def _cmd_deployment_preflight(self, params: dict) -> dict:
         """Return setup-specific readiness without changing appliance state."""
@@ -904,16 +887,21 @@ class RpcHandler:
         discovery = getattr(self._gateway, "_discovery_service", None)
         if not discovery:
             raise RuntimeError("Equipment discovery is not available on this Gateway")
+        scan_id = str(params.get("scan_id") or "").strip()
+        if not scan_id:
+            raise ValueError("A canonical scan_id is required")
         if params.get("cancel"):
-            discovery.cancel_current_scan()
+            discovery.cancel_current_scan(scan_id)
             return {
                 "status": "cancelled",
+                "scan_id": scan_id,
                 "message": "The equipment scan was cancelled.",
                 "retryable": True,
             }
-        discovery.start_guided_scan(params)
+        outcome = discovery.start_guided_scan(params)
         return {
-            "status": "running",
+            "status": outcome.get("status", "running"),
+            "scan_id": scan_id,
             "message": "Equipment discovery started. Results will appear as each target is checked.",
             "retryable": True,
         }

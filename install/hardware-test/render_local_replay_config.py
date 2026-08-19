@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--modbus-host",
         required=True,
-        help="Laptop 2 IP/host running the Modbus TCP simulator.",
+        help="Laptop 2 simulator address printed as the manual-fallback reference.",
     )
     parser.add_argument("--modbus-port", type=int, default=502, help="Modbus TCP port. Default: 502.")
     parser.add_argument("--template", type=Path, default=default_template(), help="Gateway config template.")
@@ -171,10 +171,12 @@ def main() -> int:
     discovery.update(
         {
             "enabled": True,
-            "scan_on_boot": True,
+            "scan_on_boot": False,
+            "scan_interval_seconds": 0,
             "tcp_subnet_scan": False,
-            "tcp_hosts": [f"{args.modbus_host}:{args.modbus_port}"],
+            "tcp_hosts": [],
             "tcp_ports": [args.modbus_port],
+            "tcp_scan_workers": 32,
         }
     )
 
@@ -192,7 +194,7 @@ def main() -> int:
     print("MQTT password: [set]")
     print(f"Guided Setup key id: {args.public_key_id}")
     print(f"Guided Setup public key: {args.public_key_b64[:8]}...{args.public_key_b64[-8:]}")
-    print(f"Modbus simulator target: {args.modbus_host}:{args.modbus_port}")
+    print(f"Manual fallback Modbus target: {args.modbus_host}:{args.modbus_port}")
     print("Local replay mode: TLS disabled only because this is private-LAN MQTT on port 1883.")
     return 0
 

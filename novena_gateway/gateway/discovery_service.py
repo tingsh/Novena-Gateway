@@ -14,10 +14,12 @@ import glob
 import ipaddress
 import logging
 import math
+import os
 import subprocess
 import socket
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import time, sleep
 from typing import Optional
 
@@ -47,13 +49,14 @@ class DiscoveryService:
         self._config = config or {}
 
         self._enabled = self._config.get("enabled", False)
-        self._scan_on_boot = self._config.get("scan_on_boot", True)
-        self._scan_interval_seconds = self._config.get("scan_interval_seconds", 3600)
+        self._scan_on_boot = self._config.get("scan_on_boot", False)
+        self._scan_interval_seconds = self._config.get("scan_interval_seconds", 0)
         self._rtu_slave_range = self._config.get("rtu_slave_range", [1, 32])
         self._rtu_baud_rates = self._config.get("rtu_baud_rates", [9600, 19200])
         # Broad subnet scanning is opt-in and never enabled by a Hub request.
         self._tcp_subnet_scan = self._config.get("tcp_subnet_scan", False)
         self._tcp_scan_timeout_ms = self._config.get("tcp_scan_timeout_ms", 500)
+        self._tcp_scan_workers = min(64, max(1, int(self._config.get("tcp_scan_workers", 32))))
         self._tcp_hosts = self._config.get("tcp_hosts", [])
         self._tcp_ports = self._config.get("tcp_ports", [502])
 
@@ -64,6 +67,8 @@ class DiscoveryService:
         self._scan_lock = threading.Lock()
         self._guided_scan_thread = None
         self._last_report = None
+        self._active_scan_id = None
+        self._reports_by_scan_id = {}
 
     def start(self):
         """Start boot and periodic scan threads if enabled."""
@@ -83,34 +88,68 @@ class DiscoveryService:
             )
             self._periodic_thread.start()
             log.info("Discovery periodic scan scheduled every %d seconds.", self._scan_interval_seconds)
+        if not self._scan_on_boot and self._scan_interval_seconds <= 0:
+            log.info("Discovery is ready for signed on-demand scans; background scanning is disabled.")
 
     def stop(self):
         """Cancel any pending scans."""
         self._stopped = True
         self._scan_cancelled.set()
 
-    def cancel_current_scan(self):
-        """Cancel the active scan without stopping the service permanently."""
+    def cancel_current_scan(self, scan_id: Optional[str] = None):
+        """Cancel only the requested active scan."""
+        if scan_id and scan_id != self._active_scan_id:
+            raise ValueError("The requested discovery scan is not active")
+        if not self._active_scan_id:
+            raise ValueError("No discovery scan is active")
         self._scan_cancelled.set()
 
     def start_guided_scan(self, options: Optional[dict] = None):
         """Start a guided scan off the MQTT callback thread so it can be cancelled."""
+        options = dict(options or {})
+        scan_id = str(options.get("scan_id") or "").strip()
+        if not scan_id:
+            raise ValueError("A canonical scan_id is required")
+        prior = self._reports_by_scan_id.get(scan_id)
+        if prior and prior.get("status") in {"complete", "cancelled", "error"}:
+            self._publish_report(prior)
+            return {"status": "replayed", "report": prior}
         if self._scan_lock.locked() or (
             self._guided_scan_thread and self._guided_scan_thread.is_alive()
         ):
+            if scan_id == self._active_scan_id:
+                return {"status": "running", "scan_id": scan_id}
             raise RuntimeError("A discovery scan is already running")
 
         self._scan_cancelled.clear()
+        self._active_scan_id = scan_id
 
         def run():
             try:
                 self.scan(
                     scan_type="guided",
-                    options=options or {},
+                    options=options,
                     reset_cancel=False,
                 )
             except Exception as exc:
                 log.exception("Guided discovery scan failed: %s", exc)
+                report = self._report(
+                    scan_id=scan_id,
+                    scan_ts=int(time() * 1000),
+                    scan_type="guided",
+                    status="error",
+                    phase="failed",
+                    interfaces=[],
+                    devices=[],
+                    skipped=[],
+                    errors=[{"code": "scan_failed", "error": str(exc)}],
+                    completed=0,
+                    total=0,
+                )
+                self._remember_and_publish(report)
+            finally:
+                if self._active_scan_id == scan_id:
+                    self._active_scan_id = None
 
         self._guided_scan_thread = threading.Thread(
             target=run,
@@ -118,6 +157,7 @@ class DiscoveryService:
             daemon=True,
         )
         self._guided_scan_thread.start()
+        return {"status": "started", "scan_id": scan_id}
 
     def _boot_scan(self):
         """Run a scan after a delay to let MQTT connection establish."""
@@ -166,60 +206,155 @@ class DiscoveryService:
         options = options or {}
         log.info("Starting discovery scan (type=%s)...", scan_type)
         scan_ts = int(time() * 1000)
+        scan_id = str(options.get("scan_id") or f"{scan_type}-{scan_ts}")
 
         interfaces = []
         discovered_devices = []
         errors = []
+        skipped = []
+        completed_targets = 0
+        total_targets = 0
 
         try:
+            configured_tcp, configured_serial = self._configured_connections()
             requested_serial_ports = options.get("serial_ports")
             serial_ports = self._approved_serial_ports(requested_serial_ports)
+            network_interfaces = []
+            approved_targets = self._approved_tcp_targets(options.get("tcp_hosts"))
+            if options.get("scope") == "attached_interfaces":
+                network_interfaces = self._enumerate_private_network_interfaces()
+                approved_targets.extend(self._targets_for_network_interfaces(network_interfaces))
+            approved_targets = list(dict.fromkeys(approved_targets))
+
+            interfaces.extend(network_interfaces)
+            interfaces.extend(self._inventory_non_modbus_interfaces())
+            total_targets = len(serial_ports) + len(approved_targets)
+            self._publish_progress(
+                scan_id,
+                scan_ts,
+                scan_type,
+                "enumerating_interfaces",
+                interfaces,
+                discovered_devices,
+                skipped,
+                errors,
+                completed_targets,
+                total_targets,
+            )
             for port in serial_ports:
                 if self._cancelled:
                     break
-                interfaces.append({"name": port, "type": "serial", "label": self._serial_label(port)})
+                interface = {
+                    "name": port,
+                    "type": "serial",
+                    "label": self._serial_label(port),
+                    "status": "scanning",
+                    "protocols": ["modbus_rtu"],
+                }
+                interfaces.append(interface)
+                if port in configured_serial:
+                    interface["status"] = "skipped_configured"
+                    skipped.append({"interface": port, "reason": "configured_or_busy"})
+                    completed_targets += 1
+                    self._publish_progress(
+                        scan_id,
+                        scan_ts,
+                        scan_type,
+                        "scanning_serial",
+                        interfaces,
+                        discovered_devices,
+                        skipped,
+                        errors,
+                        completed_targets,
+                        total_targets,
+                    )
+                    continue
                 try:
                     devices = self._scan_rtu_interface(port)
                     discovered_devices.extend(devices)
-                    self._publish_progress(scan_ts, scan_type, interfaces, discovered_devices, errors)
+                    interface["status"] = "complete"
                 except Exception as e:
                     log.warning("Error scanning RTU port %s: %s", port, e)
                     errors.append({"interface": port, "error": str(e)})
+                    interface["status"] = "error"
+                completed_targets += 1
+                self._publish_progress(
+                    scan_id,
+                    scan_ts,
+                    scan_type,
+                    "scanning_serial",
+                    interfaces,
+                    discovered_devices,
+                    skipped,
+                    errors,
+                    completed_targets,
+                    total_targets,
+                )
 
-            approved_targets = self._approved_tcp_targets(options.get("tcp_hosts"))
+            skipped_targets = [target for target in approved_targets if target in configured_tcp]
+            approved_targets = [target for target in approved_targets if target not in configured_tcp]
+            for host, port in skipped_targets:
+                skipped.append({"interface": f"{host}:{port}", "reason": "already_configured"})
+                completed_targets += 1
             if approved_targets or (scan_type != "guided" and self._tcp_subnet_scan):
-                interfaces.append({"name": "ethernet", "type": "ethernet", "label": "Approved LAN targets"})
+                if not network_interfaces:
+                    interfaces.append(
+                        {
+                            "name": "ethernet",
+                            "type": "ethernet",
+                            "label": "Approved LAN targets",
+                            "status": "scanning",
+                            "protocols": ["modbus_tcp"],
+                        }
+                    )
                 try:
-                    tcp_devices = self._scan_tcp_network(
-                        approved_targets=approved_targets,
-                        progress_callback=lambda partial: self._publish_progress(
+                    tcp_progress_completed = 0
+
+                    def publish_tcp_progress(partial, completed, _total):
+                        nonlocal tcp_progress_completed
+                        tcp_progress_completed = completed
+                        self._publish_progress(
+                            scan_id,
                             scan_ts,
                             scan_type,
+                            "scanning_ethernet",
                             interfaces,
                             discovered_devices + partial,
+                            skipped,
                             errors,
-                        ),
+                            completed_targets + completed,
+                            total_targets,
+                        )
+
+                    tcp_devices = self._scan_tcp_network(
+                        approved_targets=approved_targets,
+                        progress_callback=publish_tcp_progress,
                     )
                     discovered_devices.extend(tcp_devices)
+                    completed_targets += tcp_progress_completed
                 except Exception as e:
                     log.warning("Error during TCP scan: %s", e)
                     errors.append({"interface": "tcp", "error": str(e)})
 
-            report = {
-                "scan_ts": scan_ts,
-                "scan_type": scan_type,
-                "status": "cancelled" if self._cancelled else "complete",
-                "interfaces": interfaces,
-                "discovered_devices": discovered_devices,
-                "errors": errors,
-            }
+            report = self._report(
+                scan_id=scan_id,
+                scan_ts=scan_ts,
+                scan_type=scan_type,
+                status="cancelled" if self._cancelled else "complete",
+                phase="cancelled" if self._cancelled else "complete",
+                interfaces=interfaces,
+                devices=discovered_devices,
+                skipped=skipped,
+                errors=errors,
+                completed=min(completed_targets, total_targets),
+                total=total_targets,
+            )
 
-            self._last_report = report
             log.info(
                 "Discovery scan complete: %d devices found across %d interfaces",
                 len(discovered_devices), len(interfaces),
             )
-            self._publish_report(report)
+            self._remember_and_publish(report)
             return report
         finally:
             self._scan_lock.release()
@@ -284,8 +419,10 @@ class DiscoveryService:
                     if self._cancelled:
                         break
                     try:
-                        result = client.read_holding_registers(0, 1, slave=slave_id)
-                        if result and not result.isError():
+                        result = client.read_holding_registers(0, count=1, slave=slave_id)
+                        # A syntactically valid Modbus exception still proves that a
+                        # Modbus slave is present at this address.
+                        if result:
                             ident = self._identify_device_rtu(client, slave_id)
                             device = {
                                 "interface": port,
@@ -325,19 +462,24 @@ class DiscoveryService:
         if approved_targets is None and self._tcp_subnet_scan:
             targets.extend(self._subnet_tcp_targets())
 
-        seen_targets = set()
-        for ip, port in targets:
-            if self._cancelled:
-                break
-            key = (ip, int(port))
-            if key in seen_targets:
-                continue
-            seen_targets.add(key)
-            device = self._probe_tcp_target(ModbusTcpClient, ip, int(port), timeout_s)
-            if device:
-                devices.append(device)
-            if progress_callback:
-                progress_callback(list(devices))
+        targets = list(dict.fromkeys((ip, int(port)) for ip, port in targets))
+        completed = 0
+        with ThreadPoolExecutor(max_workers=self._tcp_scan_workers, thread_name_prefix="DiscoveryTCP") as pool:
+            futures = {
+                pool.submit(self._probe_tcp_target, ModbusTcpClient, ip, port, timeout_s): (ip, port)
+                for ip, port in targets
+            }
+            for future in as_completed(futures):
+                if self._cancelled:
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                completed += 1
+                device = future.result()
+                if device:
+                    devices.append(device)
+                if progress_callback:
+                    progress_callback(list(devices), completed, len(targets))
 
         return devices
 
@@ -410,14 +552,127 @@ class DiscoveryService:
                     targets.append((ip, int(port)))
         return targets
 
+    def _enumerate_private_network_interfaces(self) -> list[dict]:
+        """Return active physical/private IPv4 interfaces eligible for a user scan."""
+        try:
+            output = subprocess.check_output(
+                ["ip", "-j", "-4", "addr", "show", "up"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            rows = __import__("json").loads(output)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return []
+        interfaces = []
+        excluded_prefixes = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wwan")
+        for row in rows:
+            name = str(row.get("ifname") or "")
+            if not name or name.startswith(excluded_prefixes):
+                continue
+            if not (
+                name.startswith(("eth", "en", "wlan", "wl"))
+                or os.path.exists(f"/sys/class/net/{name}/device")
+            ):
+                continue
+            for address in row.get("addr_info") or []:
+                if address.get("family") != "inet":
+                    continue
+                try:
+                    ip = ipaddress.ip_address(address.get("local"))
+                except ValueError:
+                    continue
+                if not ip.is_private or ip.is_loopback or ip.is_link_local:
+                    continue
+                interfaces.append(
+                    {
+                        "name": name,
+                        "type": "wifi" if name.startswith(("wl", "wlan")) else "ethernet",
+                        "label": f"{name} · {ip}",
+                        "address": str(ip),
+                        "prefixlen": int(address.get("prefixlen", 24)),
+                        "status": "ready",
+                        "protocols": ["modbus_tcp"],
+                    }
+                )
+        return interfaces
+
+    def _targets_for_network_interfaces(self, interfaces: list[dict]) -> list[tuple[str, int]]:
+        """Scan no more than the local /24, without escaping a smaller attached subnet."""
+        targets = []
+        for interface in interfaces:
+            local_ip = ipaddress.ip_address(interface["address"])
+            prefixlen = max(24, int(interface.get("prefixlen", 24)))
+            network = ipaddress.ip_network(f"{local_ip}/{prefixlen}", strict=False)
+            for host in network.hosts():
+                if host == local_ip:
+                    continue
+                for port in self._tcp_ports:
+                    targets.append((str(host), int(port)))
+        return targets
+
+    def _inventory_non_modbus_interfaces(self) -> list[dict]:
+        interfaces = []
+        for path in sorted(glob.glob("/sys/class/net/can*")):
+            interfaces.append(
+                {
+                    "name": os.path.basename(path),
+                    "type": "can",
+                    "label": os.path.basename(path).upper(),
+                    "status": "unsupported_protocol_discovery",
+                    "protocols": [],
+                }
+            )
+        serial_usb = {os.path.realpath(path) for path in glob.glob("/sys/class/tty/ttyUSB*/device")}
+        for path in sorted(glob.glob("/sys/bus/usb/devices/*")):
+            if ":" in os.path.basename(path) or not os.path.exists(os.path.join(path, "idVendor")):
+                continue
+            usb_path = os.path.realpath(path)
+            if any(serial_path.startswith(f"{usb_path}{os.sep}") for serial_path in serial_usb):
+                continue
+            manufacturer = self._read_sysfs_text(os.path.join(path, "manufacturer"))
+            product = self._read_sysfs_text(os.path.join(path, "product"))
+            label = " ".join(part for part in (manufacturer, product) if part) or os.path.basename(path)
+            interfaces.append(
+                {
+                    "name": os.path.basename(path),
+                    "type": "usb",
+                    "label": label,
+                    "status": "unsupported_protocol_discovery",
+                    "protocols": [],
+                }
+            )
+        return interfaces
+
+    @staticmethod
+    def _read_sysfs_text(path: str) -> str:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip()[:120]
+        except OSError:
+            return ""
+
+    def _configured_connections(self) -> tuple[set[tuple[str, int]], set[str]]:
+        tcp = set()
+        serial = set()
+        config = getattr(self._gateway, "_config", {}) or {}
+        for connector in config.get("connectors") or []:
+            master = (connector.get("config") or {}).get("master") or {}
+            for slave in master.get("slaves") or []:
+                if str(slave.get("type") or "").lower() == "tcp" and slave.get("host"):
+                    tcp.add((str(slave["host"]), int(slave.get("port", 502))))
+                elif slave.get("port"):
+                    serial.add(str(slave["port"]))
+        return tcp, serial
+
     def _probe_tcp_target(self, client_class, ip: str, port: int, timeout_s: float) -> Optional[dict]:
+        client = None
         try:
             sock = socket.create_connection((ip, port), timeout=timeout_s)
             sock.close()
             client = client_class(ip, port=port, timeout=1)
             if client.connect():
-                result = client.read_holding_registers(0, 1, slave=1)
-                if result and not result.isError():
+                result = client.read_holding_registers(0, count=1, slave=1)
+                if result:
                     ident = self._identify_device_tcp(client, 1)
                     device = {
                         "interface": f"{ip}:{port}",
@@ -428,13 +683,17 @@ class DiscoveryService:
                         "registers_found": self._count_registers(client, 1),
                     }
                     log.info("Found TCP device: %s at %s:%s", device["signature"], ip, port)
-                    client.close()
                     return device
-            client.close()
         except (socket.timeout, ConnectionRefusedError, OSError):
             pass
         except Exception as e:
             log.debug("TCP discovery probe failed for %s:%s: %s", ip, port, e)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
         return None
 
     # ─── Device identification ────────────────────────────────────────
@@ -476,7 +735,7 @@ class DiscoveryService:
         for vendor_name, reg_info in VENDOR_ID_REGISTERS.items():
             try:
                 result = client.read_holding_registers(
-                    reg_info["address"], reg_info["count"], slave=slave_id
+                    reg_info["address"], count=reg_info["count"], slave=slave_id
                 )
                 if result and not result.isError():
                     raw_val = result.registers[0]
@@ -500,7 +759,7 @@ class DiscoveryService:
         last_good = 0
         for count in counts:
             try:
-                result = client.read_holding_registers(0, count, slave=slave_id)
+                result = client.read_holding_registers(0, count=count, slave=slave_id)
                 if result and not result.isError():
                     last_good = count
                 else:
@@ -570,13 +829,13 @@ class DiscoveryService:
                 if not 0 <= address <= 65535 or not 1 <= count <= 4:
                     raise ValueError("Datapoint address or register count is outside the safe validation range")
                 if function_code == 4:
-                    response = client.read_input_registers(address, count, slave=slave_id)
+                    response = client.read_input_registers(address, count=count, slave=slave_id)
                 elif function_code == 3:
-                    response = client.read_holding_registers(address, count, slave=slave_id)
+                    response = client.read_holding_registers(address, count=count, slave=slave_id)
                 elif function_code == 2:
-                    response = client.read_discrete_inputs(address, count, slave=slave_id)
+                    response = client.read_discrete_inputs(address, count=count, slave=slave_id)
                 elif function_code == 1:
-                    response = client.read_coils(address, count, slave=slave_id)
+                    response = client.read_coils(address, count=count, slave=slave_id)
                 else:
                     raise ValueError("Validation supports read-only Modbus function codes 1, 2, 3, and 4")
                 if not response or response.isError():
@@ -842,14 +1101,57 @@ class DiscoveryService:
         self._publisher.publish_attributes(payload)
         log.info("Published discovery report to Cloud (%d devices)", len(report.get("discovered_devices", [])))
 
-    def _publish_progress(self, scan_ts, scan_type, interfaces, devices, errors):
-        self._publish_report(
-            {
-                "scan_ts": scan_ts,
-                "scan_type": scan_type,
-                "status": "running",
-                "interfaces": list(interfaces),
-                "discovered_devices": list(devices),
-                "errors": list(errors),
-            }
+    @staticmethod
+    def _report(
+        *, scan_id, scan_ts, scan_type, status, phase, interfaces,
+        devices, skipped, errors, completed, total,
+    ):
+        updated_at = int(time() * 1000)
+        report = {
+            "schema_version": 1,
+            "scan_id": scan_id,
+            "scan_ts": scan_ts,
+            "started_at": scan_ts,
+            "updated_at": updated_at,
+            "scan_type": scan_type,
+            "status": status,
+            "phase": phase,
+            "progress": {"completed": completed, "total": total},
+            "interfaces": list(interfaces),
+            "discovered_devices": list(devices),
+            "skipped_configured": list(skipped),
+            "errors": list(errors),
+        }
+        if status in {"complete", "cancelled", "error"}:
+            report["completed_at"] = updated_at
+        return report
+
+    def _remember_and_publish(self, report: dict):
+        self._last_report = report
+        scan_id = report.get("scan_id")
+        if scan_id:
+            self._reports_by_scan_id[scan_id] = report
+            if len(self._reports_by_scan_id) > 20:
+                oldest = next(iter(self._reports_by_scan_id))
+                self._reports_by_scan_id.pop(oldest, None)
+        self._publish_report(report)
+
+    def _publish_progress(
+        self, scan_id, scan_ts, scan_type, phase, interfaces,
+        devices, skipped, errors, completed, total,
+    ):
+        report = self._report(
+            scan_id=scan_id,
+            scan_ts=scan_ts,
+            scan_type=scan_type,
+            status="running",
+            phase=phase,
+            interfaces=interfaces,
+            devices=devices,
+            skipped=skipped,
+            errors=errors,
+            completed=completed,
+            total=total,
         )
+        self._reports_by_scan_id[scan_id] = report
+        self._publish_report(report)
