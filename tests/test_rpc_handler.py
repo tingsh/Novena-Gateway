@@ -548,19 +548,25 @@ class TestRpcHandler(unittest.TestCase):
 
     def test_guided_discovery_starts_asynchronously_and_can_be_cancelled(self):
         discovery = MagicMock()
+        discovery.start_guided_scan.return_value = {"status": "started", "scan_id": "scan-1"}
         self.mock_gateway._discovery_service = discovery
 
         started = self.handler._cmd_deployment_discover(
-            {"tcp_hosts": ["192.168.1.50:502"]}
+            {"scan_id": "scan-1", "scope": "attached_interfaces"}
         )
-        cancelled = self.handler._cmd_deployment_discover({"cancel": True})
+        cancelled = self.handler._cmd_deployment_discover({"scan_id": "scan-1", "cancel": True})
 
         discovery.start_guided_scan.assert_called_once_with(
-            {"tcp_hosts": ["192.168.1.50:502"]}
+            {"scan_id": "scan-1", "scope": "attached_interfaces"}
         )
-        discovery.cancel_current_scan.assert_called_once()
-        self.assertEqual(started["status"], "running")
+        discovery.cancel_current_scan.assert_called_once_with("scan-1")
+        self.assertEqual(started["status"], "started")
         self.assertEqual(cancelled["status"], "cancelled")
+
+    def test_guided_discovery_requires_scan_id(self):
+        self.mock_gateway._discovery_service = MagicMock()
+        with self.assertRaisesRegex(ValueError, "scan_id"):
+            self.handler._cmd_deployment_discover({"scope": "attached_interfaces"})
 
     def test_update_firmware(self):
         """update_firmware should verify a signed manifest before running the upgrade."""

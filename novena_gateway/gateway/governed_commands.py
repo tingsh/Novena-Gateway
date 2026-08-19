@@ -312,6 +312,7 @@ class GovernedCommandGuard:
         if (envelope.get("target") or {}).get("gateway_serial") != self._serial_number:
             raise GovernedCommandRejected("Diagnostic command targets a different Gateway")
         if envelope.get("method") not in {
+            "scan_devices",
             "deployment_preflight",
             "deployment_discover",
             "deployment_validate",

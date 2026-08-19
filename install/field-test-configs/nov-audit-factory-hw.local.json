@@ -64,12 +64,12 @@
     },
     "discovery": {
       "enabled": true,
-      "scan_on_boot": true,
-      "scan_interval_seconds": 300,
+      "scan_on_boot": false,
+      "scan_interval_seconds": 0,
       "rtu_slave_range": [1, 8],
       "rtu_baud_rates": [9600, 19200],
       "tcp_subnet_scan": false,
-      "tcp_hosts": ["10.0.0.20:502"],
+      "tcp_hosts": [],
       "tcp_ports": [502],
       "tcp_scan_timeout_ms": 500
     }
