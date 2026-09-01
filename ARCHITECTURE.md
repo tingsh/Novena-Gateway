@@ -77,7 +77,7 @@ graph TD
 | **NovenaMqttPublisher** | Bidirectional paho-mqtt v2.x client. Handles TLS (one-way / mTLS), LWT, publish, subscribe, auto-reconnect. |
 | **NovenaGateway** | Core orchestrator. Config validation on startup, `sd_notify` watchdog integration, wires all handlers and connectors. |
 | **PayloadFormatter** | Converts `ConvertedData` from connectors into the Novena Hub JSON schema. |
-| **RemoteLogHandler** | Attaches to Python root logger. Buffers in a deque (500 max), flushes every 5 s in batches of 20. |
+| **RemoteLogHandler** | Attaches to Python root logger. Buffers in a deque (500 max), flushes every 5 s in batches of 20, and bounds identical remote warning copies without changing local logs. |
 | **AttributeSyncHandler** | Publishes heartbeat every 60 s (IP, uptime, firmware, devices, status). Handles inbound attribute push. |
 | **ConnectivityHealthHandler** | Periodically checks default route, DNS, broker TCP, TLS, MQTT state, and publishes actionable connectivity attributes. |
 | **RemoteConfigHandler** | Receives config from cloud, validates, backs up, writes atomically, hot-reloads connectors, rolls back failed connector starts, sends ACK. |
@@ -193,13 +193,15 @@ Entry point: `python -m novena_gateway.main --config config.json`
 1. Any Python logger in the gateway emits a record (e.g., `log.warning("Timeout polling Power Meter 1")`)
 2. `RemoteLogHandler.emit()` (installed on root logger) receives it
 3. **Skip** if level < `min_level` (default `INFO`) or if the logger is `novena_gateway.mqtt_publisher` (infinite loop guard)
-4. **Buffer** — appends to a `deque` (max 500 entries)
-5. **Flush thread** (every 5 s) batches up to 20 entries and calls `NovenaMqttPublisher.publish_logs()`
-6. Published to `v1/gateway/NF-EDGE-001/logs`:
+4. **Remote-copy safety** — sends the first warning/error, suppresses an identical non-critical copy for the configured bounded window, and can emit a suppressed-count summary. CRITICAL records, distinct warning/error signatures, activation/configuration failures and state changes remain visible. Local handlers still retain every record and full traceback.
+5. **Customer-safe copy** — forwards the log message and a concise exception type/message, not a repeated Python traceback. Metadata still identifies logger, module and line.
+6. **Buffer** — appends to a `deque` (max 500 entries)
+7. **Flush thread** (every 5 s) batches up to 20 entries and calls `NovenaMqttPublisher.publish_logs()`
+8. Published to `v1/gateway/NF-EDGE-001/logs`:
    ```json
    {"logs": [{"ts": ..., "level": "WARNING", "message": "Timeout polling Power Meter 1"}]}
    ```
-7. **Cloud**: `GatewayLog.objects.bulk_create()` — logs appear in the dashboard log viewer
+9. **Cloud**: `GatewayLog.objects.bulk_create()` — logs appear in the dashboard log viewer
 
 ### Flow 5 — Attribute Heartbeat (edge ↔ cloud)
 
@@ -364,7 +366,9 @@ The gateway is configured entirely through `config.json`. Below is the full stru
       "min_level": "INFO",
       "batch_size": 20,
       "flush_interval_seconds": 5,
-      "max_buffer_size": 500
+      "max_buffer_size": 500,
+      "duplicate_window_seconds": 300,
+      "duplicate_summary": true
     },
     "attribute_sync": {
       "enabled": true,

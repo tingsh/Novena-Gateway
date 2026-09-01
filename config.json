@@ -51,7 +51,9 @@
       "min_level": "INFO",
       "batch_size": 20,
       "flush_interval_seconds": 5,
-      "max_buffer_size": 500
+      "max_buffer_size": 500,
+      "duplicate_window_seconds": 300,
+      "duplicate_summary": true
     },
     "attribute_sync": {
       "enabled": true,
