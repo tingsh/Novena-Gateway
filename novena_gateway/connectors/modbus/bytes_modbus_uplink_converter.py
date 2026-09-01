@@ -12,11 +12,13 @@
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
+from struct import pack, unpack
 from time import time
 from typing import List, Union
 
+from pymodbus.client.mixin import ModbusClientMixin
 from pymodbus.constants import Endian
-from pymodbus.payload import BinaryPayloadDecoder
+from pymodbus.utilities import pack_bitstring, unpack_bitstring
 
 from novena_gateway.connectors.modbus.entities.bytes_uplink_converter_config import BytesUplinkConverterConfig
 from novena_gateway.connectors.modbus.modbus_converter import ModbusConverter
@@ -213,17 +215,10 @@ class BytesModbusUplinkConverter(ModbusConverter):
         decoded_data = None
 
         if config['functionCode'] in (1, 2):
-            try:
-                decoder = self.from_coils(encoded_data, endian_order=endian_order,
-                                          word_endian_order=word_endian_order)
-            except TypeError:
-                decoder = self.from_coils(encoded_data, word_endian_order=word_endian_order)
-
-            decoded_data = self.decode_from_registers(decoder, config)
+            decoded_data = self.decode_from_coils(encoded_data, config, endian_order)
         elif config['functionCode'] in (3, 4):
-            decoder = BinaryPayloadDecoder.fromRegisters(encoded_data, byteorder=endian_order,
-                                                         wordorder=word_endian_order)
-            decoded_data = self.decode_from_registers(decoder, config)
+            decoded_data = self.decode_from_registers(encoded_data, config,
+                                                      endian_order, word_endian_order)
 
             if config.get('divider'):
                 decoded_data = float(decoded_data) / float(config['divider'])
@@ -238,80 +233,110 @@ class BytesModbusUplinkConverter(ModbusConverter):
         return decoded_data
 
     @staticmethod
-    def from_coils(coils, endian_order=Endian.LITTLE, word_endian_order=Endian.BIG):
-        _is_wordorder = '_wordorder' in BinaryPayloadDecoder.fromCoils.__code__.co_varnames
-        if _is_wordorder:
-            try:
-                decoder = BinaryPayloadDecoder.fromCoils(coils, byteorder=endian_order,
-                                                         _wordorder=word_endian_order)
-            except TypeError:
-                decoder = BinaryPayloadDecoder.fromCoils(coils, _wordorder=word_endian_order)
-        else:
-            try:
-                decoder = BinaryPayloadDecoder.fromCoils(coils, byteorder=endian_order,
-                                                         wordorder=word_endian_order)
-            except TypeError:
-                decoder = BinaryPayloadDecoder.fromCoils(coils, wordorder=word_endian_order)
+    def _register_bytes(registers):
+        return b''.join(pack('>H', register) for register in registers)
 
-        return decoder
+    @classmethod
+    def _ordered_registers(cls, registers, byte_order, word_order):
+        words = [cls._register_bytes([register]) for register in registers]
+        if byte_order == Endian.LITTLE:
+            words = [word[::-1] for word in words]
+        if word_order == Endian.LITTLE:
+            words.reverse()
+        return [unpack('>H', word)[0] for word in words]
 
-    def decode_from_registers(self, decoder, configuration):
+    @staticmethod
+    def _coil_payload(coils):
+        coils = list(coils)
+        if padding := len(coils) % 8:
+            coils = ([False] * padding) + coils
+        return b''.join(pack_bitstring(chunk[::-1])
+                        for chunk in (coils[index:index + 8]
+                                      for index in range(0, len(coils), 8)))
+
+    def decode_from_coils(self, coils, configuration, endian_order=Endian.LITTLE):
+        payload = self._coil_payload(coils)
+        lower_type = configuration['type'].lower()
+        objects_count = self._objects_count(configuration)
+
+        if lower_type in ('bit', 'bits'):
+            decoded = unpack_bitstring(payload[:2])
+            return self._format_decoded(decoded[-objects_count:], configuration, lower_type)
+
+        if lower_type in ('string', 'bytes'):
+            return self._format_decoded(
+                payload[:objects_count * 2], configuration, lower_type
+            )
+
+        if lower_type in ('8int', '8uint'):
+            decoded = unpack('>b' if lower_type == '8int' else '>B', payload[:1])[0]
+            return self._format_decoded(decoded, configuration, lower_type)
+
+        if len(payload) % 2:
+            raise ValueError('Coil payload does not contain a complete register')
+        registers = [unpack('>H', payload[index:index + 2])[0]
+                     for index in range(0, len(payload), 2)]
+        return self.decode_from_registers(registers, configuration, endian_order, Endian.BIG)
+
+    @staticmethod
+    def _objects_count(configuration):
+        return configuration.get('objectsCount',
+                                 configuration.get('registersCount',
+                                                   configuration.get('registerCount', 1)))
+
+    def decode_from_registers(self, registers, configuration,
+                              endian_order=Endian.BIG, word_endian_order=Endian.BIG):
         objects_count = configuration.get("objectsCount",
                                           configuration.get("registersCount", configuration.get("registerCount", 1)))
         lower_type = configuration["type"].lower()
+        raw_payload = self._register_bytes(registers)
 
-        decoder_functions = {
-            'string': decoder.decode_string,
-            'bytes': decoder.decode_string,
-            'bit': decoder.decode_bits,
-            'bits': decoder.decode_bits,
-            '8int': decoder.decode_8bit_int,
-            '8uint': decoder.decode_8bit_uint,
-            '16int': decoder.decode_16bit_int,
-            '16uint': decoder.decode_16bit_uint,
-            '16float': decoder.decode_16bit_float,
-            '32int': decoder.decode_32bit_int,
-            '32uint': decoder.decode_32bit_uint,
-            '32float': decoder.decode_32bit_float,
-            '64int': decoder.decode_64bit_int,
-            '64uint': decoder.decode_64bit_uint,
-            '64float': decoder.decode_64bit_float,
-            }
-
-        decoded = None
-
-        if lower_type in ['bit', 'bits']:
-            decoded = decoder_functions[lower_type]()
-            decoded_lastbyte = decoder_functions[lower_type]()
-            decoded += decoded_lastbyte
-            decoded = decoded[len(decoded)-objects_count:]
-
-        elif lower_type == "string":
-            decoded = decoder_functions[lower_type](objects_count * 2)
-
-        elif lower_type == "bytes":
-            decoded = decoder_functions[lower_type](size=objects_count * 2)
-
-        elif decoder_functions.get(lower_type) is not None:
-            decoded = decoder_functions[lower_type]()
-
-        elif lower_type in ['int', 'long', 'integer']:
-            type_ = str(objects_count * 16) + "int"
-            assert decoder_functions.get(type_) is not None
-            decoded = decoder_functions[type_]()
-
-        elif lower_type in ["double", "float"]:
-            type_ = str(objects_count * 16) + "float"
-            assert decoder_functions.get(type_) is not None
-            decoded = decoder_functions[type_]()
-
-        elif lower_type == 'uint':
-            type_ = str(objects_count * 16) + "uint"
-            assert decoder_functions.get(type_) is not None
-            decoded = decoder_functions[type_]()
-
+        if lower_type in ('string', 'bytes'):
+            decoded = raw_payload[:objects_count * 2]
+        elif lower_type in ('bit', 'bits'):
+            decoded = ModbusClientMixin.convert_from_registers(
+                registers, ModbusClientMixin.DATATYPE.BITS
+            )[-objects_count:]
+        elif lower_type in ('8int', '8uint'):
+            decoded = unpack('>b' if lower_type == '8int' else '>B', raw_payload[:1])[0]
         else:
-            self._log.error("Unknown type: %s", lower_type)
+            resolved_type = lower_type
+            if lower_type in ('int', 'long', 'integer'):
+                resolved_type = f'{objects_count * 16}int'
+            elif lower_type in ('double', 'float'):
+                resolved_type = f'{objects_count * 16}float'
+            elif lower_type == 'uint':
+                resolved_type = f'{objects_count * 16}uint'
+
+            ordered_registers = self._ordered_registers(registers, endian_order,
+                                                        word_endian_order)
+            if resolved_type == '16float':
+                decoded = unpack('>e', self._register_bytes(ordered_registers[:1]))[0]
+            else:
+                decoder_types = {
+                    '16int': ModbusClientMixin.DATATYPE.INT16,
+                    '16uint': ModbusClientMixin.DATATYPE.UINT16,
+                    '32int': ModbusClientMixin.DATATYPE.INT32,
+                    '32uint': ModbusClientMixin.DATATYPE.UINT32,
+                    '32float': ModbusClientMixin.DATATYPE.FLOAT32,
+                    '64int': ModbusClientMixin.DATATYPE.INT64,
+                    '64uint': ModbusClientMixin.DATATYPE.UINT64,
+                    '64float': ModbusClientMixin.DATATYPE.FLOAT64,
+                }
+                data_type = decoder_types.get(resolved_type)
+                if data_type is None:
+                    self._log.error("Unknown type: %s", lower_type)
+                    decoded = None
+                else:
+                    required_registers = data_type.value[1]
+                    decoded = ModbusClientMixin.convert_from_registers(
+                        ordered_registers[:required_registers], data_type
+                    )
+
+        return self._format_decoded(decoded, configuration, lower_type)
+
+    def _format_decoded(self, decoded, configuration, lower_type):
+        objects_count = self._objects_count(configuration)
 
         if isinstance(decoded, int):
             result_data = decoded

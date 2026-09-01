@@ -4,7 +4,7 @@ import sys
 import os
 import logging
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,7 +19,14 @@ class TestRemoteLogHandler(unittest.TestCase):
             publisher=self.mock_publisher,
             serial_number="NF-TEST-001",
             config={"enabled": True, "min_level": "INFO", "batch_size": 5,
-                     "flush_interval_seconds": 999}
+                     "flush_interval_seconds": 999, "duplicate_window_seconds": 60}
+        )
+
+    @staticmethod
+    def record(level, message, name="test.logger", exc_info=None):
+        return logging.LogRecord(
+            name=name, level=level, pathname="test.py", lineno=10,
+            msg=message, args=(), exc_info=exc_info
         )
 
     def test_emit_buffers_log_records(self):
@@ -99,6 +106,81 @@ class TestRemoteLogHandler(unittest.TestCase):
         )
         handler.emit(record)
         self.assertEqual(len(handler._buffer), 0)
+
+    @patch("novena_gateway.gateway.remote_log_handler.monotonic", side_effect=[0, 10, 20])
+    def test_identical_warnings_are_forwarded_once_within_window(self, _monotonic):
+        for _ in range(3):
+            self.handler.emit(self.record(logging.WARNING, "Repeated library warning"))
+
+        self.assertEqual(len(self.handler._buffer), 1)
+        self.assertEqual(self.handler._buffer[0]["message"], "Repeated library warning")
+
+    @patch("novena_gateway.gateway.remote_log_handler.monotonic", side_effect=[0, 10, 61])
+    def test_expired_duplicate_window_emits_summary_and_new_occurrence(self, _monotonic):
+        for _ in range(3):
+            self.handler.emit(self.record(logging.WARNING, "Repeated library warning"))
+
+        self.assertEqual(len(self.handler._buffer), 3)
+        self.assertIn("Suppressed 1 identical remote warning records", self.handler._buffer[1]["message"])
+        self.assertEqual(self.handler._buffer[2]["message"], "Repeated library warning")
+
+    @patch("novena_gateway.gateway.remote_log_handler.monotonic", side_effect=[0, 10, 20])
+    def test_final_flush_summarizes_suppressed_warning_count(self, _monotonic):
+        self.handler.emit(self.record(logging.WARNING, "Repeated library warning"))
+        self.handler.emit(self.record(logging.WARNING, "Repeated library warning"))
+        self.handler._stopped = True
+
+        self.handler._flush()
+
+        payload = self.mock_publisher.publish_logs.call_args.args[0]
+        self.assertEqual(len(payload["logs"]), 2)
+        self.assertIn("Suppressed 1 identical remote warning records", payload["logs"][1]["message"])
+
+    @patch("novena_gateway.gateway.remote_log_handler.monotonic", side_effect=[0, 1])
+    def test_distinct_warnings_remain_visible(self, _monotonic):
+        self.handler.emit(self.record(logging.WARNING, "Temperature probe A timeout"))
+        self.handler.emit(self.record(logging.WARNING, "Temperature probe B timeout"))
+
+        self.assertEqual(len(self.handler._buffer), 2)
+
+    @patch("novena_gateway.gateway.remote_log_handler.monotonic", side_effect=[0, 1, 2])
+    def test_identical_errors_are_bounded_but_distinct_errors_remain_visible(self, _monotonic):
+        self.handler.emit(self.record(logging.ERROR, "Connector A failed"))
+        self.handler.emit(self.record(logging.ERROR, "Connector A failed"))
+        self.handler.emit(self.record(logging.ERROR, "Connector B failed"))
+
+        self.assertEqual(len(self.handler._buffer), 2)
+
+    def test_critical_records_are_never_suppressed(self):
+        self.handler.emit(self.record(logging.CRITICAL, "Gateway storage corrupt"))
+        self.handler.emit(self.record(logging.CRITICAL, "Gateway storage corrupt"))
+
+        self.assertEqual(len(self.handler._buffer), 2)
+
+    @patch("novena_gateway.gateway.remote_log_handler.monotonic")
+    def test_state_activation_and_configuration_warnings_are_never_suppressed(self, _monotonic):
+        for message in (
+            "Gateway state changed to offline",
+            "Activation failed for claimed gateway",
+            "Configuration failed validation",
+        ):
+            self.handler.emit(self.record(logging.WARNING, message))
+            self.handler.emit(self.record(logging.WARNING, message))
+
+        self.assertEqual(len(self.handler._buffer), 6)
+
+    def test_remote_exception_copy_is_concise_without_traceback(self):
+        try:
+            raise ValueError("bad register")
+        except ValueError:
+            exc_info = sys.exc_info()
+
+        self.handler.emit(self.record(logging.ERROR, "Polling failed", exc_info=exc_info))
+
+        message = self.handler._buffer[0]["message"]
+        self.assertIn("ValueError: bad register", message)
+        self.assertNotIn("Traceback", message)
+        self.assertNotIn("test_remote_log_handler.py", message)
 
 
 if __name__ == "__main__":
