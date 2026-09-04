@@ -78,7 +78,9 @@
       "config_journal_path": "/var/lib/novena-gateway/deployment_setup/config_journal.json"
     },
     "rpc": {
-      "enabled": true
+      "enabled": true,
+      "command_policy_path": "/var/lib/novena-gateway/remote_control/policy.json",
+      "command_journal_path": "/var/lib/novena-gateway/remote_control/command_journal.json"
     },
     "discovery": {
       "enabled": true,

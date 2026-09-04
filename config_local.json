@@ -16,12 +16,12 @@
   },
   "storage": {
     "sqlite": {
-      "data_file_path": "storage/sqlite/",
+      "data_file_path": "/var/lib/novena-gateway/sqlite/",
       "max_read_records_count": 50,
       "writing_batch_size": 50
     },
-    "update_path": "storage/update",
-    "ota_status_path": "storage/update/ota_status.json"
+    "update_path": "/var/lib/novena-gateway/update",
+    "ota_status_path": "/var/lib/novena-gateway/ota_status.json"
   },
   "logging": {
     "file": "./novena-gateway.log",
@@ -49,9 +49,9 @@
     },
     "remote_config": {
       "enabled": true,
-      "backup_dir": "config_backups",
-      "last_known_good_path": "last_known_good_config.json",
-      "config_journal_path": "storage/deployment_setup/config_journal.json"
+      "backup_dir": "/var/lib/novena-gateway/config_backups",
+      "last_known_good_path": "/var/lib/novena-gateway/last_known_good_config.json",
+      "config_journal_path": "/var/lib/novena-gateway/deployment_setup/config_journal.json"
     },
     "rpc": {
       "enabled": true,
@@ -60,8 +60,8 @@
       "max_clock_offset_seconds": 5,
       "trusted_command_keys": {},
       "revoked_command_key_ids": [],
-      "command_policy_path": "storage/remote_control/policy.json",
-      "command_journal_path": "storage/remote_control/command_journal.json"
+      "command_policy_path": "/var/lib/novena-gateway/remote_control/policy.json",
+      "command_journal_path": "/var/lib/novena-gateway/remote_control/command_journal.json"
     }
   },
   "connectors": [

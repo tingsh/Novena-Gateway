@@ -106,6 +106,7 @@ class TestRpcHandler(unittest.TestCase):
     def setUp(self):
         self.mock_publisher = MagicMock()
         self.mock_gateway = MockGateway()
+        self.runtime_dir = tempfile.mkdtemp()
 
         # Create a temp config file
         self.config_file = tempfile.NamedTemporaryFile(
@@ -120,7 +121,11 @@ class TestRpcHandler(unittest.TestCase):
             publisher=self.mock_publisher,
             serial_number="NF-TEST-001",
             config_path=self.config_file.name,
-            config={"enabled": True}
+            config={
+                "enabled": True,
+                "command_policy_path": os.path.join(self.runtime_dir, "policy.json"),
+                "command_journal_path": os.path.join(self.runtime_dir, "command_journal.json"),
+            }
         )
         self.update_dir = tempfile.mkdtemp()
         self.ota_private_key = Ed25519PrivateKey.generate()
@@ -139,6 +144,7 @@ class TestRpcHandler(unittest.TestCase):
         os.unlink(self.public_key_file.name)
         import shutil
         shutil.rmtree(self.update_dir)
+        shutil.rmtree(self.runtime_dir)
 
     def _tar_bytes(self, unsafe_name=None):
         content = io.BytesIO()

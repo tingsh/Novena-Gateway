@@ -14,6 +14,8 @@ from time import time
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from novena_gateway.gateway.runtime_paths import COMMAND_JOURNAL_PATH, COMMAND_POLICY_PATH
+
 
 class GovernedCommandRejected(ValueError):
     pass
@@ -124,11 +126,9 @@ class GovernedCommandGuard:
                 self._keys[key_id] = Ed25519PublicKey.from_public_bytes(base64.b64decode(encoded, validate=True))
             except (ValueError, TypeError):
                 continue
-        journal_path = config.get("command_journal_path", "storage/remote_control/command_journal.json")
+        journal_path = config.get("command_journal_path", COMMAND_JOURNAL_PATH)
         self.journal = DurableCommandJournal(journal_path)
-        self._policy_path = os.path.abspath(
-            config.get("command_policy_path", "storage/remote_control/policy.json")
-        )
+        self._policy_path = os.path.abspath(config.get("command_policy_path", COMMAND_POLICY_PATH))
         self._policy = self._load_policy()
         self._device_locks = {}
         self._locks_guard = threading.Lock()

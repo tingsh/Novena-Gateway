@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from novena_gateway.gateway.runtime_paths import CONFIG_JOURNAL_PATH
+
 
 GUIDED_SETUP_SCHEMA_VERSION = 1
 CAPABILITY_GUIDED_SETUP = "guided_setup_v1"
@@ -111,7 +113,7 @@ class ConfigEnvelopeGuard:
                 continue
         journal_path = config.get(
             "config_journal_path",
-            "storage/deployment_setup/config_journal.json",
+            CONFIG_JOURNAL_PATH,
         )
         self.journal = ConfigReplayJournal(journal_path)
 

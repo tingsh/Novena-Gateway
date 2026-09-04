@@ -61,6 +61,7 @@ from novena_gateway.gateway.ota_security import (
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 from novena_gateway.gateway.redaction import redact_diagnostics, redact_secrets
 from novena_gateway.gateway.remote_control_protocol import REMOTE_CONTROL_PROTOCOL_VERSION
+from novena_gateway.gateway.runtime_paths import UPDATE_PATH
 
 log = logging.getLogger("novena_gateway.rpc_handler")
 
@@ -1026,13 +1027,9 @@ class RpcHandler:
 
         self._publish_ota_status("accepted", version=version, error=None, rollback=False)
 
-        # Determine paths
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        base_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
-
         # Create staging directory
         storage_cfg = getattr(self._gateway, "_config", {}).get("storage", {})
-        update_dir = storage_cfg.get("update_path") or os.path.join(base_dir, "storage", "update")
+        update_dir = storage_cfg.get("update_path") or UPDATE_PATH
         os.makedirs(update_dir, exist_ok=True)
 
         install_dir = storage_cfg.get("install_path") or "/opt/novena-gateway"

@@ -45,6 +45,7 @@ from novena_gateway.gateway.remote_control_protocol import (
     REMOTE_CONTROL_PROTOCOL_VERSION,
     remote_control_capabilities,
 )
+from novena_gateway.gateway.runtime_paths import UPDATE_PATH
 
 log = logging.getLogger("novena_gateway.attribute_sync")
 
@@ -215,7 +216,7 @@ class AttributeSyncHandler:
         storage_cfg = config.get("storage", {})
         status_path = storage_cfg.get("ota_status_path")
         if not status_path:
-            update_path = storage_cfg.get("update_path", "storage/update")
+            update_path = storage_cfg.get("update_path", UPDATE_PATH)
             status_path = os.path.join(update_path, "ota_status.json")
         if not os.path.exists(status_path):
             return {}

@@ -16,9 +16,15 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import strftime
 
+from novena_gateway.gateway.runtime_paths import (
+    COMMAND_JOURNAL_PATH,
+    COMMAND_POLICY_PATH,
+    CONFIG_JOURNAL_PATH,
+)
+
 SERIAL = "NOV-AUDIT-FACTORY-HW"
 DEFAULT_OUTPUT = Path("/etc/novena-gateway/config.json")
-DEFAULT_JOURNAL = Path("/var/lib/novena-gateway/deployment_setup/config_journal.json")
+DEFAULT_JOURNAL = Path(CONFIG_JOURNAL_PATH)
 
 
 def repo_root() -> Path:
@@ -164,6 +170,8 @@ def main() -> int:
             "trusted_clock": True,
             "trusted_command_keys": {args.public_key_id: args.public_key_b64},
             "revoked_command_key_ids": [],
+            "command_policy_path": COMMAND_POLICY_PATH,
+            "command_journal_path": COMMAND_JOURNAL_PATH,
         }
     )
 

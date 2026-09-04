@@ -53,6 +53,7 @@ class TestRemoteConfigHandler(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.config_path = os.path.join(self.test_dir, "config.json")
         self.backup_dir = os.path.join(self.test_dir, "backups")
+        self.journal_path = os.path.join(self.test_dir, "deployment_setup", "config_journal.json")
 
         # Write initial config
         self.initial_config = {
@@ -71,7 +72,11 @@ class TestRemoteConfigHandler(unittest.TestCase):
             publisher=self.mock_publisher,
             serial_number="NF-TEST-001",
             config_path=self.config_path,
-            config={"enabled": True, "backup_dir": self.backup_dir}
+            config={
+                "enabled": True,
+                "backup_dir": self.backup_dir,
+                "config_journal_path": self.journal_path,
+            }
         )
 
     def tearDown(self):
@@ -195,7 +200,11 @@ class TestRemoteConfigHandler(unittest.TestCase):
             publisher=self.mock_publisher,
             serial_number="NF-TEST-001",
             config_path=self.config_path,
-            config={"enabled": True, "backup_dir": self.backup_dir}
+            config={
+                "enabled": True,
+                "backup_dir": self.backup_dir,
+                "config_journal_path": self.journal_path,
+            }
         )
 
         result = handler._apply_full_update(

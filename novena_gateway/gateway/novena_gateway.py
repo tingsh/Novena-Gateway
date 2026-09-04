@@ -27,6 +27,7 @@ from novena_gateway.gateway.payload_formatter import PayloadFormatter
 from novena_gateway.gateway.remote_config_handler import RemoteConfigHandler
 from novena_gateway.gateway.remote_log_handler import RemoteLogHandler
 from novena_gateway.gateway.rpc_handler import RpcHandler
+from novena_gateway.gateway.runtime_paths import DATA_DIR
 from novena_gateway.gateway.network_watchdog_handler import NetworkWatchdogHandler
 from novena_gateway.tb_utility.tb_loader import TBModuleLoader
 from novena_gateway.gateway.hardware_preflight import run_preflight
@@ -232,7 +233,47 @@ class NovenaGateway:
                     elif not os.path.isfile(val):
                         errors.append(f"mqtt.tls.{key} — file not found: {val}")
 
+        NovenaGateway._validate_runtime_state_paths(config, errors)
+
         return errors
+
+    @staticmethod
+    def _validate_runtime_state_paths(config: dict, errors: list):
+        """Reject writable service state paths that would resolve inside the read-only install tree."""
+
+        def get_path(dotted_path: str):
+            current = config
+            for part in dotted_path.split("."):
+                if not isinstance(current, dict) or part not in current:
+                    return None
+                current = current[part]
+            return current
+
+        for dotted_path in (
+            "storage.sqlite.data_file_path",
+            "storage.update_path",
+            "storage.ota_status_path",
+            "features.remote_config.backup_dir",
+            "features.remote_config.last_known_good_path",
+            "features.remote_config.config_journal_path",
+            "features.rpc.command_policy_path",
+            "features.rpc.command_journal_path",
+        ):
+            value = get_path(dotted_path)
+            if not value:
+                continue
+            if not isinstance(value, str):
+                errors.append(f"{dotted_path} — must be a filesystem path string")
+                continue
+            if not os.path.isabs(value):
+                errors.append(f"{dotted_path} — must be an absolute path under {DATA_DIR}")
+                continue
+            real_path = os.path.abspath(value)
+            if real_path == "/opt/novena-gateway" or real_path.startswith("/opt/novena-gateway/"):
+                errors.append(f"{dotted_path} — writable runtime state must not be under /opt/novena-gateway")
+                continue
+            if real_path != DATA_DIR and not real_path.startswith(f"{DATA_DIR}/"):
+                errors.append(f"{dotted_path} — must be under {DATA_DIR}")
 
     @staticmethod
     def deployment_mode(config: dict = None) -> str:

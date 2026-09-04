@@ -22,6 +22,7 @@ from time import sleep, time
 from typing import Callable, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
+from novena_gateway.gateway.runtime_paths import SQLITE_DATA_FILE_PATH
 from novena_gateway.storage.sqlite.sqlite_event_storage import SQLiteEventStorage
 
 log = logging.getLogger("novena_gateway.mqtt_publisher")
@@ -72,7 +73,7 @@ class NovenaMqttPublisher:
         # Instantiate SQLiteEventStorage as local database buffer
         sqlite_config = self._storage_config.get("sqlite", self._storage_config)
         storage_config = {
-            "data_file_path": "storage/sqlite/",
+            "data_file_path": SQLITE_DATA_FILE_PATH,
             "max_read_records_count": 50,
             "writing_batch_size": 50,
         }

@@ -44,9 +44,14 @@
     "remote_config": {
       "enabled": true,
       "backup_dir": "/var/lib/novena-gateway/config_backups",
-      "last_known_good_path": "/var/lib/novena-gateway/last_known_good_config.json"
+      "last_known_good_path": "/var/lib/novena-gateway/last_known_good_config.json",
+      "config_journal_path": "/var/lib/novena-gateway/deployment_setup/config_journal.json"
     },
-    "rpc": {"enabled": true},
+    "rpc": {
+      "enabled": true,
+      "command_policy_path": "/var/lib/novena-gateway/remote_control/policy.json",
+      "command_journal_path": "/var/lib/novena-gateway/remote_control/command_journal.json"
+    },
     "discovery": {
       "enabled": true,
       "scan_on_boot": false,

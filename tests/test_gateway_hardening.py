@@ -210,8 +210,9 @@ class TestGatewayHardening(unittest.TestCase):
         )
         publisher.publish_now.assert_called_once_with({"kind": "immediate"}, "v1/gateway/NF-SCOPED/attributes")
 
+    @patch("novena_gateway.gateway.novena_mqtt_publisher.SQLiteEventStorage")
     @patch("novena_gateway.gateway.novena_mqtt_publisher.mqtt.Client")
-    def test_configured_telemetry_topic_cannot_override_serial_scope(self, mock_client):
+    def test_configured_telemetry_topic_cannot_override_serial_scope(self, mock_client, _storage):
         publisher = NovenaMqttPublisher(
             {
                 "host": "localhost",
