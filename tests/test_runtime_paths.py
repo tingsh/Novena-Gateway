@@ -6,6 +6,7 @@ import base64
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -161,6 +162,39 @@ class RuntimePathConfigTest(unittest.TestCase):
             config = json.loads(output_path.read_text())
             for field in RUNTIME_PATH_FIELDS:
                 assert_var_lib_path(self, get_nested(config, field))
+
+    def test_local_replay_renderer_runs_directly_from_repo_checkout(self):
+        script_path = REPO_ROOT / "install/hardware-test/render_local_replay_config.py"
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "config.json"
+            public_key_b64 = base64.b64encode(b"0" * 32).decode()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--mqtt-host",
+                    "192.168.0.101",
+                    "--mqtt-password",
+                    "claim-code",
+                    "--public-key-id",
+                    "setup-key",
+                    "--public-key-b64",
+                    public_key_b64,
+                    "--modbus-host",
+                    "10.0.0.20",
+                    "--output",
+                    str(output_path),
+                    "--no-backup",
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(output_path.exists())
 
 
 if __name__ == "__main__":

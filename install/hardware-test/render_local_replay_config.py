@@ -12,9 +12,14 @@ import argparse
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import strftime
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from novena_gateway.gateway.runtime_paths import (
     COMMAND_JOURNAL_PATH,
@@ -28,7 +33,7 @@ DEFAULT_JOURNAL = Path(CONFIG_JOURNAL_PATH)
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return REPO_ROOT
 
 
 def default_template() -> Path:
