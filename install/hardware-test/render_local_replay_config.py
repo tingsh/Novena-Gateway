@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import grp
 import json
 import os
+import pwd
 import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -99,13 +101,27 @@ def backup_existing(path: Path) -> Path | None:
     return backup
 
 
+def desired_config_permissions(path: Path) -> tuple[int | None, int | None, int]:
+    if path.resolve() == DEFAULT_OUTPUT:
+        try:
+            uid = pwd.getpwnam("novena").pw_uid
+            gid = grp.getgrnam("novena").gr_gid
+            return uid, gid, 0o640
+        except KeyError:
+            return None, None, 0o640
+    return None, None, 0o600
+
+
 def atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile("w", dir=str(path.parent), delete=False) as tmp:
         json.dump(data, tmp, indent=2)
         tmp.write("\n")
         tmp_path = Path(tmp.name)
-    os.chmod(tmp_path, 0o600)
+    uid, gid, mode = desired_config_permissions(path)
+    os.chmod(tmp_path, mode)
+    if uid is not None and gid is not None:
+        os.chown(tmp_path, uid, gid)
     os.replace(tmp_path, path)
 
 

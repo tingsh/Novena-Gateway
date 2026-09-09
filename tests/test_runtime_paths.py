@@ -196,6 +196,33 @@ class RuntimePathConfigTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(output_path.exists())
 
+    def test_local_replay_renderer_makes_default_config_readable_by_service_user(self):
+        script_path = REPO_ROOT / "install/hardware-test/render_local_replay_config.py"
+        spec = importlib.util.spec_from_file_location("render_local_replay_config", script_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+
+        with patch.object(module.pwd, "getpwnam") as getpwnam:
+            with patch.object(module.grp, "getgrnam") as getgrnam:
+                getpwnam.return_value.pw_uid = 999
+                getgrnam.return_value.gr_gid = 999
+
+                uid, gid, mode = module.desired_config_permissions(module.DEFAULT_OUTPUT)
+
+        self.assertEqual((uid, gid, mode), (999, 999, 0o640))
+
+    def test_local_replay_renderer_keeps_non_default_outputs_private(self):
+        script_path = REPO_ROOT / "install/hardware-test/render_local_replay_config.py"
+        spec = importlib.util.spec_from_file_location("render_local_replay_config", script_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+
+        uid, gid, mode = module.desired_config_permissions(Path("/tmp/novena-test-config.json"))
+
+        self.assertEqual((uid, gid, mode), (None, None, 0o600))
+
 
 if __name__ == "__main__":
     unittest.main()
