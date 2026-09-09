@@ -205,6 +205,7 @@ def main() -> int:
             "tcp_subnet_scan": False,
             "tcp_hosts": [],
             "tcp_ports": [args.modbus_port],
+            "tcp_scan_timeout_ms": 1500,
             "tcp_scan_workers": 32,
         }
     )

@@ -19,7 +19,7 @@ import subprocess
 import socket
 import struct
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from time import time, sleep
 from typing import Optional
 
@@ -55,10 +55,15 @@ class DiscoveryService:
         self._rtu_baud_rates = self._config.get("rtu_baud_rates", [9600, 19200])
         # Broad subnet scanning is opt-in and never enabled by a Hub request.
         self._tcp_subnet_scan = self._config.get("tcp_subnet_scan", False)
-        self._tcp_scan_timeout_ms = self._config.get("tcp_scan_timeout_ms", 500)
+        self._tcp_scan_timeout_ms = self._config.get("tcp_scan_timeout_ms", 1500)
         self._tcp_scan_workers = min(64, max(1, int(self._config.get("tcp_scan_workers", 32))))
+        self._tcp_scan_max_seconds = min(
+            300,
+            max(1, int(self._config.get("tcp_scan_max_seconds", 120))),
+        )
         self._tcp_hosts = self._config.get("tcp_hosts", [])
         self._tcp_ports = self._config.get("tcp_ports", [502])
+        self._last_tcp_scan_timed_out = False
 
         self._scan_thread = None
         self._periodic_thread = None
@@ -308,6 +313,7 @@ class DiscoveryService:
                         }
                     )
                 try:
+                    self._last_tcp_scan_timed_out = False
                     tcp_progress_completed = 0
 
                     def publish_tcp_progress(partial, completed, _total):
@@ -332,16 +338,38 @@ class DiscoveryService:
                     )
                     discovered_devices.extend(tcp_devices)
                     completed_targets += tcp_progress_completed
+                    if self._last_tcp_scan_timed_out:
+                        errors.append(
+                            {
+                                "interface": "tcp",
+                                "code": "tcp_scan_timed_out",
+                                "error": (
+                                    "Modbus TCP discovery timed out before every network "
+                                    "target could be checked."
+                                ),
+                            }
+                        )
                 except Exception as e:
                     log.warning("Error during TCP scan: %s", e)
                     errors.append({"interface": "tcp", "error": str(e)})
+
+            tcp_timed_out = any(error.get("code") == "tcp_scan_timed_out" for error in errors)
+            if self._cancelled:
+                terminal_status = "cancelled"
+                terminal_phase = "cancelled"
+            elif tcp_timed_out and not discovered_devices:
+                terminal_status = "error"
+                terminal_phase = "timed_out"
+            else:
+                terminal_status = "complete"
+                terminal_phase = "complete"
 
             report = self._report(
                 scan_id=scan_id,
                 scan_ts=scan_ts,
                 scan_type=scan_type,
-                status="cancelled" if self._cancelled else "complete",
-                phase="cancelled" if self._cancelled else "complete",
+                status=terminal_status,
+                phase=terminal_phase,
                 interfaces=interfaces,
                 devices=discovered_devices,
                 skipped=skipped,
@@ -464,22 +492,51 @@ class DiscoveryService:
 
         targets = list(dict.fromkeys((ip, int(port)) for ip, port in targets))
         completed = 0
-        with ThreadPoolExecutor(max_workers=self._tcp_scan_workers, thread_name_prefix="DiscoveryTCP") as pool:
+        deadline = time() + self._tcp_scan_max_seconds
+        pool = ThreadPoolExecutor(max_workers=self._tcp_scan_workers, thread_name_prefix="DiscoveryTCP")
+        try:
             futures = {
                 pool.submit(self._probe_tcp_target, ModbusTcpClient, ip, port, timeout_s): (ip, port)
                 for ip, port in targets
             }
-            for future in as_completed(futures):
+            pending = set(futures)
+            while pending:
                 if self._cancelled:
-                    for pending in futures:
-                        pending.cancel()
                     break
-                completed += 1
-                device = future.result()
-                if device:
-                    devices.append(device)
-                if progress_callback:
-                    progress_callback(list(devices), completed, len(targets))
+                remaining = deadline - time()
+                if remaining <= 0:
+                    self._last_tcp_scan_timed_out = True
+                    log.warning(
+                        "TCP discovery timed out after %ds (%d/%d targets checked)",
+                        self._tcp_scan_max_seconds,
+                        completed,
+                        len(targets),
+                    )
+                    break
+                done, pending = wait(
+                    pending,
+                    timeout=min(1.0, remaining),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
+                for future in done:
+                    completed += 1
+                    try:
+                        device = future.result(timeout=0)
+                    except Exception as exc:
+                        ip, port = futures[future]
+                        log.debug("TCP discovery probe failed for %s:%s: %s", ip, port, exc)
+                        device = None
+                    if device:
+                        devices.append(device)
+                    if progress_callback:
+                        progress_callback(list(devices), completed, len(targets))
+        finally:
+            for pending_future in futures:
+                if not pending_future.done():
+                    pending_future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
 
         return devices
 
@@ -669,7 +726,7 @@ class DiscoveryService:
         try:
             sock = socket.create_connection((ip, port), timeout=timeout_s)
             sock.close()
-            client = client_class(ip, port=port, timeout=1)
+            client = client_class(ip, port=port, timeout=max(timeout_s, 1))
             if client.connect():
                 result = client.read_holding_registers(0, count=1, slave=1)
                 if result:

@@ -7,6 +7,7 @@ import json
 import os
 import struct
 import tempfile
+import time as time_module
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -174,6 +175,45 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.service.start()
         self.assertIsNone(self.service._scan_thread)
         self.assertIsNone(self.service._periodic_thread)
+
+    def test_attached_tcp_discovery_uses_cm4_tolerant_timeout_default(self):
+        service = DiscoveryService(
+            gateway=MagicMock(),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={"enabled": True},
+        )
+
+        self.assertEqual(service._tcp_scan_timeout_ms, 1500)
+        self.assertEqual(service._tcp_scan_workers, 32)
+        self.assertEqual(service._tcp_scan_max_seconds, 120)
+
+    @patch.object(DiscoveryService, "_configured_tcp_targets", return_value=[("10.0.0.20", 502)])
+    def test_tcp_scan_deadline_returns_when_probe_worker_stalls(self, _targets):
+        service = DiscoveryService(
+            gateway=MagicMock(),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={
+                "enabled": True,
+                "tcp_scan_workers": 1,
+                "tcp_scan_max_seconds": 1,
+            },
+        )
+        progress = []
+
+        def stalled_probe(*_args, **_kwargs):
+            time_module.sleep(2)
+            return None
+
+        started = time_module.monotonic()
+        with patch.object(service, "_probe_tcp_target", side_effect=stalled_probe):
+            devices = service._scan_tcp_network(progress_callback=lambda _partial, completed, total: progress.append((completed, total)))
+
+        self.assertEqual(devices, [])
+        self.assertEqual(progress, [])
+        self.assertTrue(service._last_tcp_scan_timed_out)
+        self.assertLess(time_module.monotonic() - started, 1.8)
 
     @patch("novena_gateway.gateway.discovery_service.os.path.exists", return_value=True)
     @patch("novena_gateway.gateway.discovery_service.subprocess.check_output")
