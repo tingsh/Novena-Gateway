@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from novena_gateway.gateway.runtime_paths import COMMAND_JOURNAL_PATH, COMMAND_POLICY_PATH
 
+DEFAULT_DIAGNOSTIC_CLOCK_SKEW_SECONDS = 120
+
 
 class GovernedCommandRejected(ValueError):
     pass
@@ -117,6 +119,12 @@ class GovernedCommandGuard:
         self._gateway = gateway
         self._trusted_clock = bool(config.get("trusted_clock", False))
         self._max_clock_offset = float(config.get("max_clock_offset_seconds", 5))
+        self._diagnostic_clock_skew = float(
+            config.get(
+                "diagnostic_clock_skew_seconds",
+                max(self._max_clock_offset, DEFAULT_DIAGNOSTIC_CLOCK_SKEW_SECONDS),
+            )
+        )
         self._keys = {}
         revoked = set(config.get("revoked_command_key_ids") or [])
         for key_id, encoded in (config.get("trusted_command_keys") or {}).items():
@@ -323,8 +331,11 @@ class GovernedCommandGuard:
         expires_at = self._parse_time(envelope.get("expires_at"))
         if expires_at <= now:
             raise GovernedCommandRejected("Diagnostic command has expired")
-        if issued_at > now:
-            raise GovernedCommandRejected("Diagnostic command was issued in the future")
+        future_skew_seconds = (issued_at - now).total_seconds()
+        if future_skew_seconds > self._diagnostic_clock_skew:
+            raise GovernedCommandRejected(
+                "Diagnostic command timestamp is outside its trusted window"
+            )
         return body
 
     def device_lock(self, device_id):

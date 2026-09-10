@@ -58,6 +58,7 @@
       "local_writeback_enabled": false,
       "trusted_clock": false,
       "max_clock_offset_seconds": 5,
+      "diagnostic_clock_skew_seconds": 120,
       "trusted_command_keys": {},
       "revoked_command_key_ids": [],
       "command_policy_path": "/var/lib/novena-gateway/remote_control/policy.json",

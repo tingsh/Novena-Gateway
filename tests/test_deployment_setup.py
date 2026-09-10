@@ -476,6 +476,7 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
             gateway=MagicMock(),
             config={
                 "trusted_clock": True,
+                "diagnostic_clock_skew_seconds": 120,
                 "trusted_command_keys": {
                     "setup-key": base64.b64encode(public_key).decode()
                 },
@@ -487,8 +488,9 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def envelope(self, *, method="deployment_preflight", expires_at=None):
+    def envelope(self, *, method="deployment_preflight", issued_at=None, expires_at=None):
         now = datetime.now(timezone.utc)
+        issued_at = issued_at or now
         body = {
             "schema_version": 1,
             "request_id": "rpc-request",
@@ -502,7 +504,7 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
             "sequence_number": 1,
             "revisions": {"template": 0, "commissioning": 0, "policy": 0},
             "policy_checksum": "",
-            "issued_at": now.isoformat(),
+            "issued_at": issued_at.isoformat(),
             "expires_at": (expires_at or (now + timedelta(minutes=2))).isoformat(),
         }
         return {
@@ -540,6 +542,28 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(GovernedCommandRejected, "expired"):
             self.guard.validate_diagnostic(expired)
+
+    def test_diagnostic_allows_small_future_clock_skew(self):
+        issued_at = datetime.now(timezone.utc) + timedelta(seconds=60)
+        verified = self.guard.validate_diagnostic(
+            self.envelope(
+                method="deployment_discover",
+                issued_at=issued_at,
+                expires_at=issued_at + timedelta(minutes=2),
+            )
+        )
+        self.assertEqual(verified["method"], "deployment_discover")
+
+    def test_diagnostic_rejects_large_future_clock_skew(self):
+        issued_at = datetime.now(timezone.utc) + timedelta(seconds=121)
+        with self.assertRaisesRegex(GovernedCommandRejected, "trusted window"):
+            self.guard.validate_diagnostic(
+                self.envelope(
+                    method="deployment_discover",
+                    issued_at=issued_at,
+                    expires_at=issued_at + timedelta(minutes=2),
+                )
+            )
 
     def test_diagnostic_evidence_redacts_nested_inline_credentials(self):
         redacted = redact_diagnostics(

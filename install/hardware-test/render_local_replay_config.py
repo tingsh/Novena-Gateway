@@ -189,6 +189,7 @@ def main() -> int:
         {
             "enabled": True,
             "trusted_clock": True,
+            "diagnostic_clock_skew_seconds": 120,
             "trusted_command_keys": {args.public_key_id: args.public_key_b64},
             "revoked_command_key_ids": [],
             "command_policy_path": COMMAND_POLICY_PATH,

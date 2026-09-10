@@ -79,6 +79,7 @@
     },
     "rpc": {
       "enabled": true,
+      "diagnostic_clock_skew_seconds": 120,
       "command_policy_path": "/var/lib/novena-gateway/remote_control/policy.json",
       "command_journal_path": "/var/lib/novena-gateway/remote_control/command_journal.json"
     },
