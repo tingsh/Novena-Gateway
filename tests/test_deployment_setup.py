@@ -189,6 +189,8 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.assertEqual(service._tcp_scan_max_seconds, 120)
         self.assertEqual(service._tcp_probe_slave_ids, [1])
         self.assertEqual(service._tcp_probe_registers, [0, 1, 3000])
+        self.assertEqual(service._tcp_probe_attempts, 3)
+        self.assertEqual(service._tcp_probe_retry_delay_ms, 200)
 
     def test_tcp_probe_uses_single_protocol_connection_without_raw_socket_precheck(self):
         response = MagicMock()
@@ -242,6 +244,38 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.assertEqual(device["signature"], "Exception Modbus")
         self.assertEqual(device["probe"]["register"], 3000)
         self.assertTrue(device["probe"]["exception_response"])
+
+    def test_tcp_probe_retries_candidate_before_giving_up(self):
+        response = MagicMock()
+        response.isError.return_value = False
+        failed_client = MagicMock()
+        failed_client.connect.return_value = False
+        successful_client = MagicMock()
+        successful_client.connect.return_value = True
+        successful_client.read_holding_registers.return_value = response
+        service = DiscoveryService(
+            gateway=MagicMock(_config={"connectors": []}),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={
+                "enabled": True,
+                "tcp_probe_attempts": 2,
+                "tcp_probe_retry_delay_ms": 0,
+            },
+        )
+
+        with patch.object(service, "_identify_device_tcp", return_value={"signature": "Retry Modbus"}), patch.object(
+            service, "_count_registers", return_value=1
+        ):
+            device = service._probe_tcp_target(
+                MagicMock(side_effect=[failed_client, successful_client]),
+                "10.0.0.20",
+                502,
+                1.5,
+            )
+
+        self.assertEqual(device["interface"], "10.0.0.20:502")
+        self.assertEqual(device["probe"]["attempt"], 2)
 
     @patch.object(DiscoveryService, "_configured_tcp_targets", return_value=[("10.0.0.20", 502)])
     def test_tcp_scan_deadline_returns_when_reachability_worker_stalls(self, _targets):

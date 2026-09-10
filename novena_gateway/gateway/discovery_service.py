@@ -77,6 +77,11 @@ class DiscoveryService:
             maximum=65535,
             limit=8,
         )
+        self._tcp_probe_attempts = min(5, max(1, int(self._config.get("tcp_probe_attempts", 3))))
+        self._tcp_probe_retry_delay_ms = min(
+            1000,
+            max(0, int(self._config.get("tcp_probe_retry_delay_ms", 200))),
+        )
         self._last_tcp_scan_timed_out = False
 
         self._scan_thread = None
@@ -777,53 +782,62 @@ class DiscoveryService:
         return tcp, serial
 
     def _probe_tcp_target(self, client_class, ip: str, port: int, timeout_s: float) -> Optional[dict]:
-        client = None
-        try:
-            client = client_class(ip, port=port, timeout=max(timeout_s, 1))
-            if client.connect():
-                for slave_id in self._tcp_probe_slave_ids:
-                    for address in self._tcp_probe_registers:
-                        try:
-                            result = client.read_holding_registers(address, count=1, slave=slave_id)
-                        except Exception as exc:
-                            log.debug(
-                                "TCP Modbus probe read failed for %s:%s slave %s register %s: %s",
-                                ip,
-                                port,
-                                slave_id,
-                                address,
-                                exc,
-                            )
-                            continue
-                        # A syntactically valid Modbus exception still proves that a
-                        # Modbus slave is present. Do not rely on response truthiness:
-                        # pymodbus exception responses may evaluate false.
-                        if result is not None:
-                            ident = self._identify_device_tcp(client, slave_id)
-                            device = {
-                                "interface": f"{ip}:{port}",
-                                "connection": "modbus_tcp",
-                                "slave_id": slave_id,
-                                "signature": ident.get("signature", "Unknown Modbus Device"),
-                                "identification": ident if ident.get("vendor") else None,
-                                "registers_found": self._count_registers(client, slave_id),
-                                "probe": {
-                                    "register": address,
-                                    "exception_response": bool(getattr(result, "isError", lambda: False)()),
-                                },
-                            }
-                            log.info("Found TCP device: %s at %s:%s", device["signature"], ip, port)
-                            return device
-        except (socket.timeout, ConnectionRefusedError, OSError):
-            pass
-        except Exception as e:
-            log.debug("TCP discovery probe failed for %s:%s: %s", ip, port, e)
-        finally:
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    pass
+        for attempt in range(1, self._tcp_probe_attempts + 1):
+            client = None
+            try:
+                client = client_class(ip, port=port, timeout=max(timeout_s, 1))
+                if client.connect():
+                    for slave_id in self._tcp_probe_slave_ids:
+                        for address in self._tcp_probe_registers:
+                            try:
+                                result = client.read_holding_registers(address, count=1, slave=slave_id)
+                            except Exception as exc:
+                                log.debug(
+                                    "TCP Modbus probe read failed for %s:%s slave %s register %s attempt %s/%s: %s",
+                                    ip,
+                                    port,
+                                    slave_id,
+                                    address,
+                                    attempt,
+                                    self._tcp_probe_attempts,
+                                    exc,
+                                )
+                                continue
+                            # A syntactically valid Modbus exception still proves that a
+                            # Modbus slave is present. Do not rely on response truthiness:
+                            # pymodbus exception responses may evaluate false.
+                            if result is not None:
+                                ident = self._identify_device_tcp(client, slave_id)
+                                device = {
+                                    "interface": f"{ip}:{port}",
+                                    "connection": "modbus_tcp",
+                                    "slave_id": slave_id,
+                                    "signature": ident.get("signature", "Unknown Modbus Device"),
+                                    "identification": ident if ident.get("vendor") else None,
+                                    "registers_found": self._count_registers(client, slave_id),
+                                    "probe": {
+                                        "register": address,
+                                        "exception_response": bool(getattr(result, "isError", lambda: False)()),
+                                        "attempt": attempt,
+                                    },
+                                }
+                                log.info("Found TCP device: %s at %s:%s", device["signature"], ip, port)
+                                return device
+                elif attempt == self._tcp_probe_attempts:
+                    log.info("TCP candidate %s:%s did not accept a Modbus client connection.", ip, port)
+            except (socket.timeout, ConnectionRefusedError, OSError) as exc:
+                if attempt == self._tcp_probe_attempts:
+                    log.info("TCP candidate %s:%s did not respond to Modbus probing: %s", ip, port, exc)
+            except Exception as e:
+                log.debug("TCP discovery probe failed for %s:%s attempt %s/%s: %s", ip, port, attempt, self._tcp_probe_attempts, e)
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            if attempt < self._tcp_probe_attempts and self._tcp_probe_retry_delay_ms > 0:
+                sleep(self._tcp_probe_retry_delay_ms / 1000.0)
         return None
 
     # ─── Device identification ────────────────────────────────────────
