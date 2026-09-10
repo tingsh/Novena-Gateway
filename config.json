@@ -93,7 +93,9 @@
       "tcp_hosts": [],
       "tcp_ports": [502],
       "tcp_scan_timeout_ms": 500,
-      "tcp_scan_workers": 32
+      "tcp_scan_workers": 32,
+      "tcp_probe_slave_ids": [1],
+      "tcp_probe_registers": [0, 1, 3000]
     }
   },
   "hardware": {

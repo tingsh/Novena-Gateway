@@ -62,7 +62,9 @@
       "tcp_subnet_scan": false,
       "tcp_hosts": [],
       "tcp_ports": [502],
-      "tcp_scan_timeout_ms": 1500
+      "tcp_scan_timeout_ms": 1500,
+      "tcp_probe_slave_ids": [1],
+      "tcp_probe_registers": [0, 1, 3000]
     }
   },
   "connectors": []

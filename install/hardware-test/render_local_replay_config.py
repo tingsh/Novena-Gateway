@@ -208,6 +208,8 @@ def main() -> int:
             "tcp_ports": [args.modbus_port],
             "tcp_scan_timeout_ms": 1500,
             "tcp_scan_workers": 32,
+            "tcp_probe_slave_ids": [1],
+            "tcp_probe_registers": [0, 1, 3000],
         }
     )
 

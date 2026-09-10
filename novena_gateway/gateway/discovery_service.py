@@ -63,6 +63,20 @@ class DiscoveryService:
         )
         self._tcp_hosts = self._config.get("tcp_hosts", [])
         self._tcp_ports = self._config.get("tcp_ports", [502])
+        self._tcp_probe_slave_ids = self._safe_int_list(
+            self._config.get("tcp_probe_slave_ids", [1]),
+            default=[1],
+            minimum=0,
+            maximum=247,
+            limit=8,
+        )
+        self._tcp_probe_registers = self._safe_int_list(
+            self._config.get("tcp_probe_registers", [0, 1, 3000]),
+            default=[0, 1, 3000],
+            minimum=0,
+            maximum=65535,
+            limit=8,
+        )
         self._last_tcp_scan_timed_out = False
 
         self._scan_thread = None
@@ -609,6 +623,22 @@ class DiscoveryService:
                     targets.append((ip, int(port)))
         return targets
 
+    @staticmethod
+    def _safe_int_list(value, *, default: list[int], minimum: int, maximum: int, limit: int) -> list[int]:
+        if not isinstance(value, list):
+            value = default
+        parsed = []
+        for item in value:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                continue
+            if minimum <= number <= maximum and number not in parsed:
+                parsed.append(number)
+            if len(parsed) >= limit:
+                break
+        return parsed or list(default)
+
     def _enumerate_private_network_interfaces(self) -> list[dict]:
         """Return active field-side Ethernet IPv4 interfaces eligible for a user scan."""
         try:
@@ -724,23 +754,41 @@ class DiscoveryService:
     def _probe_tcp_target(self, client_class, ip: str, port: int, timeout_s: float) -> Optional[dict]:
         client = None
         try:
-            sock = socket.create_connection((ip, port), timeout=timeout_s)
-            sock.close()
             client = client_class(ip, port=port, timeout=max(timeout_s, 1))
             if client.connect():
-                result = client.read_holding_registers(0, count=1, slave=1)
-                if result:
-                    ident = self._identify_device_tcp(client, 1)
-                    device = {
-                        "interface": f"{ip}:{port}",
-                        "connection": "modbus_tcp",
-                        "slave_id": 1,
-                        "signature": ident.get("signature", "Unknown Modbus Device"),
-                        "identification": ident if ident.get("vendor") else None,
-                        "registers_found": self._count_registers(client, 1),
-                    }
-                    log.info("Found TCP device: %s at %s:%s", device["signature"], ip, port)
-                    return device
+                for slave_id in self._tcp_probe_slave_ids:
+                    for address in self._tcp_probe_registers:
+                        try:
+                            result = client.read_holding_registers(address, count=1, slave=slave_id)
+                        except Exception as exc:
+                            log.debug(
+                                "TCP Modbus probe read failed for %s:%s slave %s register %s: %s",
+                                ip,
+                                port,
+                                slave_id,
+                                address,
+                                exc,
+                            )
+                            continue
+                        # A syntactically valid Modbus exception still proves that a
+                        # Modbus slave is present. Do not rely on response truthiness:
+                        # pymodbus exception responses may evaluate false.
+                        if result is not None:
+                            ident = self._identify_device_tcp(client, slave_id)
+                            device = {
+                                "interface": f"{ip}:{port}",
+                                "connection": "modbus_tcp",
+                                "slave_id": slave_id,
+                                "signature": ident.get("signature", "Unknown Modbus Device"),
+                                "identification": ident if ident.get("vendor") else None,
+                                "registers_found": self._count_registers(client, slave_id),
+                                "probe": {
+                                    "register": address,
+                                    "exception_response": bool(getattr(result, "isError", lambda: False)()),
+                                },
+                            }
+                            log.info("Found TCP device: %s at %s:%s", device["signature"], ip, port)
+                            return device
         except (socket.timeout, ConnectionRefusedError, OSError):
             pass
         except Exception as e:

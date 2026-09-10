@@ -187,6 +187,61 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.assertEqual(service._tcp_scan_timeout_ms, 1500)
         self.assertEqual(service._tcp_scan_workers, 32)
         self.assertEqual(service._tcp_scan_max_seconds, 120)
+        self.assertEqual(service._tcp_probe_slave_ids, [1])
+        self.assertEqual(service._tcp_probe_registers, [0, 1, 3000])
+
+    def test_tcp_probe_uses_single_protocol_connection_without_raw_socket_precheck(self):
+        response = MagicMock()
+        response.isError.return_value = False
+        client = MagicMock()
+        client.connect.return_value = True
+        client.read_holding_registers.return_value = response
+        service = DiscoveryService(
+            gateway=MagicMock(_config={"connectors": []}),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={"enabled": True},
+        )
+
+        with patch(
+            "novena_gateway.gateway.discovery_service.socket.create_connection",
+            side_effect=AssertionError("raw socket precheck should not run"),
+        ), patch.object(service, "_identify_device_tcp", return_value={"signature": "Test Modbus"}), patch.object(
+            service, "_count_registers", return_value=1
+        ):
+            device = service._probe_tcp_target(lambda *_args, **_kwargs: client, "10.0.0.20", 502, 1.5)
+
+        self.assertEqual(device["interface"], "10.0.0.20:502")
+        client.read_holding_registers.assert_called_once_with(0, count=1, slave=1)
+
+    def test_tcp_probe_accepts_falsey_modbus_exception_response(self):
+        class FalseyExceptionResponse:
+            registers = []
+
+            def __bool__(self):
+                return False
+
+            def isError(self):
+                return True
+
+        client = MagicMock()
+        client.connect.return_value = True
+        client.read_holding_registers.side_effect = [None, None, FalseyExceptionResponse()]
+        service = DiscoveryService(
+            gateway=MagicMock(_config={"connectors": []}),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={"enabled": True},
+        )
+
+        with patch.object(service, "_identify_device_tcp", return_value={"signature": "Exception Modbus"}), patch.object(
+            service, "_count_registers", return_value=0
+        ):
+            device = service._probe_tcp_target(lambda *_args, **_kwargs: client, "10.0.0.20", 502, 1.5)
+
+        self.assertEqual(device["signature"], "Exception Modbus")
+        self.assertEqual(device["probe"]["register"], 3000)
+        self.assertTrue(device["probe"]["exception_response"])
 
     @patch.object(DiscoveryService, "_configured_tcp_targets", return_value=[("10.0.0.20", 502)])
     def test_tcp_scan_deadline_returns_when_probe_worker_stalls(self, _targets):
