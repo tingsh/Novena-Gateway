@@ -244,7 +244,7 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.assertTrue(device["probe"]["exception_response"])
 
     @patch.object(DiscoveryService, "_configured_tcp_targets", return_value=[("10.0.0.20", 502)])
-    def test_tcp_scan_deadline_returns_when_probe_worker_stalls(self, _targets):
+    def test_tcp_scan_deadline_returns_when_reachability_worker_stalls(self, _targets):
         service = DiscoveryService(
             gateway=MagicMock(),
             publisher=MagicMock(),
@@ -262,13 +262,39 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
             return None
 
         started = time_module.monotonic()
-        with patch.object(service, "_probe_tcp_target", side_effect=stalled_probe):
+        with patch.object(service, "_tcp_endpoint_reachable", side_effect=stalled_probe):
             devices = service._scan_tcp_network(progress_callback=lambda _partial, completed, total: progress.append((completed, total)))
 
         self.assertEqual(devices, [])
         self.assertEqual(progress, [])
         self.assertTrue(service._last_tcp_scan_timed_out)
         self.assertLess(time_module.monotonic() - started, 1.8)
+
+    def test_tcp_scan_protocol_probes_only_reachable_candidates(self):
+        service = DiscoveryService(
+            gateway=MagicMock(),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={
+                "enabled": True,
+                "tcp_scan_workers": 2,
+            },
+        )
+        device = {"interface": "10.0.0.20:502", "connection": "modbus_tcp"}
+
+        def reachable(ip, _port, _timeout):
+            return ip == "10.0.0.20"
+
+        with patch.object(service, "_tcp_endpoint_reachable", side_effect=reachable), patch.object(
+            service, "_probe_tcp_target", return_value=device
+        ) as probe:
+            devices = service._scan_tcp_network(
+                approved_targets=[("10.0.0.19", 502), ("10.0.0.20", 502), ("10.0.0.21", 502)]
+            )
+
+        self.assertEqual(devices, [device])
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[1:3], ("10.0.0.20", 502))
 
     @patch("novena_gateway.gateway.discovery_service.os.path.exists", return_value=True)
     @patch("novena_gateway.gateway.discovery_service.subprocess.check_output")

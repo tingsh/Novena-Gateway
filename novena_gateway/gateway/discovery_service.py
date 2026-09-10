@@ -506,11 +506,12 @@ class DiscoveryService:
 
         targets = list(dict.fromkeys((ip, int(port)) for ip, port in targets))
         completed = 0
+        open_targets = []
         deadline = time() + self._tcp_scan_max_seconds
         pool = ThreadPoolExecutor(max_workers=self._tcp_scan_workers, thread_name_prefix="DiscoveryTCP")
         try:
             futures = {
-                pool.submit(self._probe_tcp_target, ModbusTcpClient, ip, port, timeout_s): (ip, port)
+                pool.submit(self._tcp_endpoint_reachable, ip, port, timeout_s): (ip, port)
                 for ip, port in targets
             }
             pending = set(futures)
@@ -536,14 +537,14 @@ class DiscoveryService:
                     continue
                 for future in done:
                     completed += 1
+                    ip, port = futures[future]
                     try:
-                        device = future.result(timeout=0)
+                        reachable = future.result(timeout=0)
                     except Exception as exc:
-                        ip, port = futures[future]
-                        log.debug("TCP discovery probe failed for %s:%s: %s", ip, port, exc)
-                        device = None
-                    if device:
-                        devices.append(device)
+                        log.debug("TCP discovery reachability check failed for %s:%s: %s", ip, port, exc)
+                        reachable = False
+                    if reachable:
+                        open_targets.append((ip, port))
                     if progress_callback:
                         progress_callback(list(devices), completed, len(targets))
         finally:
@@ -552,7 +553,31 @@ class DiscoveryService:
                     pending_future.cancel()
             pool.shutdown(wait=False, cancel_futures=True)
 
+        if open_targets and not self._cancelled:
+            log.info("TCP discovery found %d open candidate endpoint(s).", len(open_targets))
+        for ip, port in open_targets:
+            if self._cancelled:
+                break
+            try:
+                device = self._probe_tcp_target(ModbusTcpClient, ip, port, timeout_s)
+            except Exception as exc:
+                log.debug("TCP discovery probe failed for %s:%s: %s", ip, port, exc)
+                device = None
+            if device:
+                devices.append(device)
+                if progress_callback:
+                    progress_callback(list(devices), completed, len(targets))
+
         return devices
+
+    @staticmethod
+    def _tcp_endpoint_reachable(ip: str, port: int, timeout_s: float) -> bool:
+        """Return whether a TCP endpoint accepts connections."""
+        try:
+            with socket.create_connection((ip, port), timeout=max(timeout_s, 0.25)):
+                return True
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            return False
 
     def _approved_tcp_targets(self, requested_hosts) -> list[tuple[str, int]]:
         if requested_hosts is None:
