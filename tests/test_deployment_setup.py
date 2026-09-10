@@ -7,6 +7,7 @@ import json
 import os
 import struct
 import tempfile
+import threading
 import time as time_module
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -164,10 +165,16 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
             self.service._approved_tcp_targets(["192.168.1.50:502"]),
             [("192.168.1.50", 502)],
         )
+        self.assertEqual(
+            self.service._approved_tcp_targets([{"host": "10.0.0.20", "port": 1502}]),
+            [("10.0.0.20", 1502)],
+        )
         with self.assertRaises(ValueError):
             self.service._approved_tcp_targets(["not-an-ip"])
         with self.assertRaises(ValueError):
             self.service._approved_tcp_targets(["224.0.0.1"])
+        with self.assertRaises(ValueError):
+            self.service._approved_tcp_targets(["127.0.0.1:502"])
         with self.assertRaises(ValueError):
             self.service._approved_tcp_targets(["192.168.1.50:70000"])
 
@@ -175,6 +182,25 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.service.start()
         self.assertIsNone(self.service._scan_thread)
         self.assertIsNone(self.service._periodic_thread)
+
+    def test_sync_modbus_client_can_be_constructed_in_gateway_worker_thread(self):
+        from pymodbus.client import ModbusTcpClient
+
+        failures = []
+
+        def construct_client():
+            try:
+                client = ModbusTcpClient("192.0.2.1", port=502, timeout=1)
+                client.close()
+            except Exception as exc:  # pragma: no cover - assertion reports the upstream error
+                failures.append(exc)
+
+        worker = threading.Thread(target=construct_client, name="GuidedDiscoveryRegression")
+        worker.start()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
 
     def test_attached_tcp_discovery_uses_cm4_tolerant_timeout_default(self):
         service = DiscoveryService(
@@ -214,7 +240,33 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
             device = service._probe_tcp_target(lambda *_args, **_kwargs: client, "10.0.0.20", 502, 1.5)
 
         self.assertEqual(device["interface"], "10.0.0.20:502")
+        self.assertTrue(device["protocol_verified"])
         client.read_holding_registers.assert_called_once_with(0, count=1, slave=1)
+
+    def test_tcp_probe_keeps_reachable_endpoint_when_common_registers_do_not_respond(self):
+        client = MagicMock()
+        client.connect.return_value = True
+        client.read_holding_registers.return_value = None
+        service = DiscoveryService(
+            gateway=MagicMock(_config={"connectors": []}),
+            publisher=MagicMock(),
+            serial_number="NF-GUIDED",
+            config={"enabled": True, "tcp_probe_attempts": 1},
+        )
+
+        device = service._probe_tcp_target(
+            lambda *_args, **_kwargs: client,
+            "10.0.0.20",
+            1502,
+            1.5,
+        )
+
+        self.assertEqual(device["interface"], "10.0.0.20:1502")
+        self.assertEqual(device["host"], "10.0.0.20")
+        self.assertEqual(device["port"], 1502)
+        self.assertFalse(device["protocol_verified"])
+        self.assertNotIn("slave_id", device)
+        self.assertEqual(device["probe"]["status"], "tcp_reachable")
 
     def test_tcp_probe_accepts_falsey_modbus_exception_response(self):
         class FalseyExceptionResponse:

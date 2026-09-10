@@ -6,8 +6,8 @@ findings to Novena Hub via MQTT attributes.
 
 Supports:
 - Modbus RTU scanning (serial ports, configurable slave range + baud rates)
-- Modbus TCP scanning (local subnet, port 502)
-- Device identification via FC43 MEI and vendor-specific registers
+- Modbus TCP endpoint discovery (local subnet or approved IP/port targets)
+- Best-effort device identification via safe protocol reads
 """
 
 import glob
@@ -608,7 +608,7 @@ class DiscoveryService:
                 parsed_port = int(port)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Invalid approved Modbus TCP target: {item}") from exc
-            if parsed.is_unspecified or parsed.is_multicast or parsed.is_reserved:
+            if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast or parsed.is_reserved:
                 raise ValueError(f"Unsafe Modbus TCP target: {host}")
             if not 1 <= parsed_port <= 65535:
                 raise ValueError(f"Invalid Modbus TCP port: {parsed_port}")
@@ -782,6 +782,23 @@ class DiscoveryService:
         return tcp, serial
 
     def _probe_tcp_target(self, client_class, ip: str, port: int, timeout_s: float) -> Optional[dict]:
+        """Enrich a reachable TCP endpoint with optional Modbus identity evidence.
+
+        Raw TCP reachability is sufficient for discovery. Unit IDs and register
+        maps vary by installation, so failed best-effort reads must not remove an
+        endpoint from the discovery report. Exact protocol reads are performed by
+        ``validate_modbus`` after the customer selects a template and connection.
+        """
+        endpoint = {
+            "interface": f"{ip}:{port}",
+            "connection": "modbus_tcp",
+            "host": ip,
+            "port": port,
+            "signature": "Reachable TCP endpoint",
+            "identification": None,
+            "protocol_verified": False,
+            "probe": {"status": "tcp_reachable"},
+        }
         for attempt in range(1, self._tcp_probe_attempts + 1):
             client = None
             try:
@@ -809,13 +826,14 @@ class DiscoveryService:
                             if result is not None:
                                 ident = self._identify_device_tcp(client, slave_id)
                                 device = {
-                                    "interface": f"{ip}:{port}",
-                                    "connection": "modbus_tcp",
+                                    **endpoint,
                                     "slave_id": slave_id,
                                     "signature": ident.get("signature", "Unknown Modbus Device"),
                                     "identification": ident if ident.get("vendor") else None,
+                                    "protocol_verified": True,
                                     "registers_found": self._count_registers(client, slave_id),
                                     "probe": {
+                                        "status": "modbus_response",
                                         "register": address,
                                         "exception_response": bool(getattr(result, "isError", lambda: False)()),
                                         "attempt": attempt,
@@ -829,7 +847,22 @@ class DiscoveryService:
                 if attempt == self._tcp_probe_attempts:
                     log.info("TCP candidate %s:%s did not respond to Modbus probing: %s", ip, port, exc)
             except Exception as e:
-                log.debug("TCP discovery probe failed for %s:%s attempt %s/%s: %s", ip, port, attempt, self._tcp_probe_attempts, e)
+                if attempt == self._tcp_probe_attempts:
+                    log.warning(
+                        "TCP endpoint %s:%s is reachable but Modbus identification failed: %s",
+                        ip,
+                        port,
+                        e,
+                    )
+                else:
+                    log.debug(
+                        "TCP discovery probe failed for %s:%s attempt %s/%s: %s",
+                        ip,
+                        port,
+                        attempt,
+                        self._tcp_probe_attempts,
+                        e,
+                    )
             finally:
                 if client is not None:
                     try:
@@ -838,7 +871,12 @@ class DiscoveryService:
                         pass
             if attempt < self._tcp_probe_attempts and self._tcp_probe_retry_delay_ms > 0:
                 sleep(self._tcp_probe_retry_delay_ms / 1000.0)
-        return None
+        log.info(
+            "Found reachable TCP endpoint at %s:%s; unit ID and register map require validation.",
+            ip,
+            port,
+        )
+        return endpoint
 
     # ─── Device identification ────────────────────────────────────────
 

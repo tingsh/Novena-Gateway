@@ -20,7 +20,7 @@ paho-mqtt>=1.6.0
 
 # Modbus (TCP + RTU)
 # Keep pinned for the qualified CM4 release; uplink decoding uses the supported 3.8 conversion API.
-pymodbus==3.8.0
+pymodbus==3.8.6
 pyserial
 pyserial-asyncio
 
