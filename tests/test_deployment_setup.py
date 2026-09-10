@@ -221,6 +221,7 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         check_output.return_value = json.dumps(
             [
                 {"ifname": "eth0", "addr_info": [{"family": "inet", "local": "10.0.0.10", "prefixlen": 16}]},
+                {"ifname": "wlan0", "addr_info": [{"family": "inet", "local": "192.168.0.20", "prefixlen": 24}]},
                 {"ifname": "docker0", "addr_info": [{"family": "inet", "local": "172.17.0.1", "prefixlen": 16}]},
                 {"ifname": "eth1", "addr_info": [{"family": "inet", "local": "8.8.8.8", "prefixlen": 24}]},
                 {"ifname": "wwan0", "addr_info": [{"family": "inet", "local": "10.20.30.40", "prefixlen": 24}]},
@@ -234,6 +235,7 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.assertEqual(len(targets), 253)
         self.assertIn(("10.0.0.20", 502), targets)
         self.assertNotIn(("10.0.0.10", 502), targets)
+        self.assertNotIn(("192.168.0.101", 502), targets)
 
     def test_attached_network_scan_does_not_escape_smaller_subnet(self):
         targets = self.service._targets_for_network_interfaces(

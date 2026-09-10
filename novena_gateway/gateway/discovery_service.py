@@ -610,7 +610,7 @@ class DiscoveryService:
         return targets
 
     def _enumerate_private_network_interfaces(self) -> list[dict]:
-        """Return active physical/private IPv4 interfaces eligible for a user scan."""
+        """Return active field-side Ethernet IPv4 interfaces eligible for a user scan."""
         try:
             output = subprocess.check_output(
                 ["ip", "-j", "-4", "addr", "show", "up"],
@@ -621,13 +621,13 @@ class DiscoveryService:
         except (OSError, subprocess.SubprocessError, ValueError):
             return []
         interfaces = []
-        excluded_prefixes = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wwan")
+        excluded_prefixes = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wlan", "wl", "wwan")
         for row in rows:
             name = str(row.get("ifname") or "")
             if not name or name.startswith(excluded_prefixes):
                 continue
             if not (
-                name.startswith(("eth", "en", "wlan", "wl"))
+                name.startswith(("eth", "en"))
                 or os.path.exists(f"/sys/class/net/{name}/device")
             ):
                 continue
@@ -643,7 +643,7 @@ class DiscoveryService:
                 interfaces.append(
                     {
                         "name": name,
-                        "type": "wifi" if name.startswith(("wl", "wlan")) else "ethernet",
+                        "type": "ethernet",
                         "label": f"{name} · {ip}",
                         "address": str(ip),
                         "prefixlen": int(address.get("prefixlen", 24)),
