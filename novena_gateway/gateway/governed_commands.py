@@ -114,10 +114,11 @@ class DurableCommandJournal:
 
 
 class GovernedCommandGuard:
-    def __init__(self, *, serial_number: str, gateway, config: dict):
+    def __init__(self, *, serial_number: str, gateway, config: dict, clock_ready=None):
         self._serial_number = serial_number
         self._gateway = gateway
         self._trusted_clock = bool(config.get("trusted_clock", False))
+        self._clock_ready = clock_ready or (lambda: self._trusted_clock)
         self._max_clock_offset = float(config.get("max_clock_offset_seconds", 5))
         self._diagnostic_clock_skew = float(
             config.get(
@@ -154,11 +155,13 @@ class GovernedCommandGuard:
         return (self._policy or {}).get("control_epoch", 0)
 
     def readiness(self):
+        clock_ready = self._trusted_clock and self._clock_ready()
         return {
             "remote_control_policy_loaded": self.policy_loaded,
             "remote_control_policy_revision": self.policy_revision,
             "remote_control_epoch": self.control_epoch,
-            "remote_control_clock_ready": self._trusted_clock,
+            "remote_control_clock_ready": clock_ready,
+            "remote_control_clock_status": "synchronized" if clock_ready else "synchronizing",
             "remote_control_journal_ready": os.path.isdir(os.path.dirname(self.journal._path)),
             "remote_control_event_spool_count": len(self.journal.reconciliation_events()),
             "remote_control_storage_healthy": os.access(os.path.dirname(self.journal._path), os.W_OK),
@@ -224,8 +227,8 @@ class GovernedCommandGuard:
             raise GovernedCommandRejected("Command timestamp is invalid") from exc
 
     def validate(self, envelope):
-        if not self._trusted_clock:
-            raise GovernedCommandRejected("Trusted clock is not ready")
+        if not self._trusted_clock or not self._clock_ready():
+            raise GovernedCommandRejected("Gateway clock is not synchronized")
         if not self._policy:
             raise GovernedCommandRejected("No valid retained control policy is loaded")
         signature = envelope.get("signature")
@@ -296,8 +299,8 @@ class GovernedCommandGuard:
 
     def validate_diagnostic(self, envelope):
         """Verify a signed, gateway-scoped diagnostic without control policy."""
-        if not self._trusted_clock:
-            raise GovernedCommandRejected("Trusted clock is not ready")
+        if not self._trusted_clock or not self._clock_ready():
+            raise GovernedCommandRejected("Gateway clock is not synchronized")
         signature = envelope.get("signature")
         key_id = envelope.get("signing_key_id")
         body = {

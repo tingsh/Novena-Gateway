@@ -97,9 +97,10 @@ class ConfigReplayJournal:
 class ConfigEnvelopeGuard:
     """Verify signed config envelopes independently at the Gateway."""
 
-    def __init__(self, *, serial_number: str, config: dict):
+    def __init__(self, *, serial_number: str, config: dict, clock_ready=None):
         self.serial_number = serial_number
         self.trusted_clock = bool(config.get("trusted_clock", False))
+        self._clock_ready = clock_ready or (lambda: self.trusted_clock)
         self.keys = {}
         revoked = set(config.get("revoked_config_key_ids") or [])
         configured_keys = config.get("trusted_config_keys") or {}
@@ -119,7 +120,7 @@ class ConfigEnvelopeGuard:
 
     @property
     def ready(self) -> bool:
-        return self.trusted_clock and bool(self.keys)
+        return self.trusted_clock and self._clock_ready() and bool(self.keys)
 
     def verify(self, wire: dict) -> tuple[dict, dict | None]:
         if not self.ready:

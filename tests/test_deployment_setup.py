@@ -150,6 +150,21 @@ class SignedConfigEnvelopeTest(unittest.TestCase):
         self.assertEqual(last["config_update_error_code"], "config_rejected")
         self.assertEqual(self.gateway.start_count, 0)
 
+    def test_guided_setup_capability_tracks_live_clock_readiness(self):
+        clock = {"ready": False}
+        handler = RemoteConfigHandler(
+            gateway=self.gateway,
+            publisher=self.publisher,
+            serial_number="NF-GUIDED",
+            config_path=self.config_path,
+            config=self.handler._handler_config,
+            clock_ready=lambda: clock["ready"],
+        )
+
+        self.assertEqual(handler.capabilities, [])
+        clock["ready"] = True
+        self.assertEqual(handler.capabilities, ["guided_setup_v1"])
+
 
 class SafeDiscoveryTargetTest(unittest.TestCase):
     def setUp(self):
@@ -638,18 +653,19 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
+        self.config = {
+            "trusted_clock": True,
+            "diagnostic_clock_skew_seconds": 120,
+            "trusted_command_keys": {
+                "setup-key": base64.b64encode(public_key).decode()
+            },
+            "command_journal_path": os.path.join(self.directory.name, "commands.json"),
+            "command_policy_path": os.path.join(self.directory.name, "policy.json"),
+        }
         self.guard = GovernedCommandGuard(
             serial_number="NF-GUIDED",
             gateway=MagicMock(),
-            config={
-                "trusted_clock": True,
-                "diagnostic_clock_skew_seconds": 120,
-                "trusted_command_keys": {
-                    "setup-key": base64.b64encode(public_key).decode()
-                },
-                "command_journal_path": os.path.join(self.directory.name, "commands.json"),
-                "command_policy_path": os.path.join(self.directory.name, "policy.json"),
-            },
+            config=self.config,
         )
 
     def tearDown(self):
@@ -685,6 +701,19 @@ class SignedDeploymentDiagnosticTest(unittest.TestCase):
     def test_signed_diagnostic_is_verified_without_control_policy(self):
         verified = self.guard.validate_diagnostic(self.envelope())
         self.assertEqual(verified["method"], "deployment_preflight")
+
+    def test_signed_diagnostic_waits_for_live_clock_synchronization(self):
+        guard = GovernedCommandGuard(
+            serial_number="NF-GUIDED",
+            gateway=MagicMock(),
+            config=self.config,
+            clock_ready=lambda: False,
+        )
+
+        self.assertFalse(guard.readiness()["remote_control_clock_ready"])
+        self.assertEqual(guard.readiness()["remote_control_clock_status"], "synchronizing")
+        with self.assertRaisesRegex(GovernedCommandRejected, "not synchronized"):
+            guard.validate_diagnostic(self.envelope())
 
     def test_tampered_diagnostic_is_rejected(self):
         envelope = self.envelope()

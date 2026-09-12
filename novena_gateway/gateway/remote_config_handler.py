@@ -65,7 +65,7 @@ class RemoteConfigHandler:
     """Handles remote configuration updates from Novena Hub."""
 
     def __init__(self, gateway, publisher, serial_number: str,
-                 config_path: str, config: Optional[dict] = None):
+                 config_path: str, config: Optional[dict] = None, clock_ready=None):
         self._gateway = gateway
         self._publisher = publisher
         self._serial_number = serial_number
@@ -96,6 +96,7 @@ class RemoteConfigHandler:
         self._envelope_guard = ConfigEnvelopeGuard(
             serial_number=serial_number,
             config=self._handler_config,
+            clock_ready=clock_ready,
         )
 
     @property

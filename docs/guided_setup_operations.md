@@ -1,8 +1,10 @@
 # Guided Setup Gateway Operations
 
 `guided_setup_v1` is the Gateway capability for secure Modbus equipment setup. The
-Gateway advertises it only when its clock is trusted and at least one Hub signing
-public key is installed.
+Gateway advertises it only when its configuration enables a trusted clock, Linux
+reports that the system clock is synchronized, and at least one Hub signing public
+key is installed. A configuration flag is policy, not evidence that the live clock
+is correct.
 
 ## Required security configuration
 
@@ -21,6 +23,13 @@ Configure these fields under `features.rpc`:
 The remote configuration handler reuses those public keys unless
 `features.remote_config.trusted_config_keys` is set explicitly. Keep the private key
 in Novena Hub; it must never be installed on a Gateway.
+
+The installer enables network time synchronization and the systemd wait-for-sync
+service when they are available. At boot the Gateway may connect to MQTT while its
+clock is still synchronizing, but it advertises `remote_control_clock_ready: false`
+and withholds `guided_setup_v1`. Hub keeps scan, validation, configuration, and
+deployment actions locked until a later heartbeat reports readiness. Do not widen
+the signed-command timestamp window to work around an unsynchronized appliance.
 
 The service account must be able to write:
 

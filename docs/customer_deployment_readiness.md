@@ -18,7 +18,7 @@ Run the installer as root:
 sudo bash install.sh
 ```
 
-The installer runs `install/hardware_setup.sh` unless `NOVENA_SKIP_HARDWARE_SETUP=1` is set. It backs up the boot config, enables USB host mode, SPI/CAN, RS485 UART overlays, and RTC overlay. Reboot the device after hardware setup.
+The installer runs `install/hardware_setup.sh` unless `NOVENA_SKIP_HARDWARE_SETUP=1` is set. It backs up the boot config, enables USB host mode, SPI/CAN, RS485 UART overlays, the RTC overlay, network time synchronization, and the systemd wait-for-sync service. Reboot the device after hardware setup. OTA updates also reapply the time-synchronization policy for already-installed Gateways.
 
 Run read-only preflight:
 
@@ -35,6 +35,7 @@ Before handoff, confirm:
 - `hardware_preflight` RPC reports USB, RS485 UART overlays, CAN overlay, RTC overlay, helper availability, and disk space.
 - `privilege_preflight` RPC reports the scoped helper is installed.
 - MQTT connects over TLS.
+- `timedatectl show -p SystemClockSynchronized --value` returns `yes`, and Hub shows the Gateway clock as ready.
 - Remote config can create connectors and rollback failed connector updates.
 - Offline buffering replays after broker or network outage.
 - OTA reports accepted, downloading, verified, restarting, then success or rollback.

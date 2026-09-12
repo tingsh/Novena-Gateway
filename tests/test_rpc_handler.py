@@ -482,7 +482,7 @@ class TestRpcHandler(unittest.TestCase):
             time.sleep(0.001)
         payload = self.mock_publisher.publish_rpc_response.call_args[0][0]
         self.assertEqual(payload["status"], "error")
-        self.assertIn("Trusted clock", payload["error"])
+        self.assertIn("clock is not synchronized", payload["error"])
 
     def test_ota_reports_initiation_not_verified_execution(self):
         self.handler._local_writeback_enabled = True

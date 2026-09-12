@@ -19,6 +19,7 @@ import sdnotify
 
 from novena_gateway.gateway.attribute_sync_handler import AttributeSyncHandler
 from novena_gateway.gateway.connectivity_health_handler import ConnectivityHealthHandler
+from novena_gateway.gateway.clock_health import SystemClockHealth
 from novena_gateway.gateway.constants import DEFAULT_CONNECTORS
 from novena_gateway.gateway.discovery_service import DiscoveryService
 from novena_gateway.gateway.entities.converted_data import ConvertedData
@@ -77,6 +78,7 @@ class NovenaGateway:
 
         # ─── Cloud feature handlers ───────────────────────────────────
         feature_cfg = self._config.get("features", {})
+        self._clock_health = SystemClockHealth()
 
         # Network watchdog handler
         self._network_watchdog = NetworkWatchdogHandler(
@@ -128,6 +130,7 @@ class NovenaGateway:
             serial_number=self._serial_number,
             config_path=config_path,
             config=remote_config_cfg,
+            clock_ready=self._clock_health.synchronized,
         )
 
         # RPC handler
@@ -137,6 +140,7 @@ class NovenaGateway:
             serial_number=self._serial_number,
             config_path=config_path,
             config=feature_cfg.get("rpc", {}),
+            clock_ready=self._clock_health.synchronized,
         )
 
         # Discovery service

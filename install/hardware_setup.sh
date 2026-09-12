@@ -41,4 +41,6 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl enable NetworkManager >/dev/null 2>&1 || true
 fi
 
+bash "$(dirname "$0")/time_sync_setup.sh"
+
 echo "Hardware setup complete. Reboot is required for boot overlay changes."

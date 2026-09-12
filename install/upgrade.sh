@@ -99,6 +99,18 @@ if [ -f "${CONFIG_PATH}" ]; then
     fi
 fi
 
+# Keep appliance clock boot policy current as part of an ordinary software update.
+# Runtime readiness still fails closed until Linux reports actual synchronization.
+if [ -f "${NEW_RELEASE_DIR}/install/time_sync_setup.sh" ]; then
+    bash "${NEW_RELEASE_DIR}/install/time_sync_setup.sh" \
+        || echo "WARNING: Time synchronization setup did not complete; signed commands remain blocked until fixed." >&2
+fi
+
+if [ -f "${NEW_RELEASE_DIR}/novena-gateway.service" ]; then
+    install -m 0644 "${NEW_RELEASE_DIR}/novena-gateway.service" /etc/systemd/system/novena-gateway.service
+    systemctl daemon-reload
+fi
+
 # 4. Atomic Symlink Swap (Blue/Green)
 echo "Swapping symlink..."
 ln -sfn "${NEW_RELEASE_DIR}" "${CURRENT_LINK}"

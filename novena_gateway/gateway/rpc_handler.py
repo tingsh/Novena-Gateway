@@ -85,7 +85,7 @@ class RpcHandler:
     """Handles inbound RPC commands from Novena Hub."""
 
     def __init__(self, gateway, publisher, serial_number: str,
-                 config_path: str, config: Optional[dict] = None):
+                 config_path: str, config: Optional[dict] = None, clock_ready=None):
         self._gateway = gateway
         self._publisher = publisher
         self._serial_number = serial_number
@@ -103,6 +103,7 @@ class RpcHandler:
             serial_number=serial_number,
             gateway=gateway,
             config=self._handler_config,
+            clock_ready=clock_ready,
         )
 
         # Command dispatch table
