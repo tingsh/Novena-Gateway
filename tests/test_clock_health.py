@@ -18,7 +18,12 @@ class SystemClockHealthTest(unittest.TestCase):
         health = SystemClockHealth(cache_seconds=0, runner=runner)
 
         self.assertTrue(health.synchronized())
-        runner.assert_called_once()
+        runner.assert_called_once_with(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
 
     def test_unsynchronized_or_unavailable_clock_fails_closed(self):
         unsynchronized = SystemClockHealth(

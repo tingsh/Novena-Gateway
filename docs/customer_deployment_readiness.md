@@ -35,7 +35,7 @@ Before handoff, confirm:
 - `hardware_preflight` RPC reports USB, RS485 UART overlays, CAN overlay, RTC overlay, helper availability, and disk space.
 - `privilege_preflight` RPC reports the scoped helper is installed.
 - MQTT connects over TLS.
-- `timedatectl show -p SystemClockSynchronized --value` returns `yes`, and Hub shows the Gateway clock as ready.
+- `timedatectl show -p NTPSynchronized --value` returns `yes`, and Hub shows the Gateway clock as ready.
 - Remote config can create connectors and rollback failed connector updates.
 - Offline buffering replays after broker or network outage.
 - OTA reports accepted, downloading, verified, restarting, then success or rollback.

@@ -83,7 +83,7 @@ class HardwarePreflight:
 
     def _clock_check(self) -> dict:
         try:
-            res = subprocess.run(["timedatectl", "show", "-p", "SystemClockSynchronized", "--value"],
+            res = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
                                  capture_output=True, text=True, timeout=3)
             value = (res.stdout or "").strip()
             return {"ok": res.returncode == 0 and value.lower() == "yes", "synchronized": value}

@@ -28,7 +28,7 @@ class SystemClockHealth:
             self._checked_at = now
             try:
                 result = self._runner(
-                    ["timedatectl", "show", "-p", "SystemClockSynchronized", "--value"],
+                    ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
                     capture_output=True,
                     text=True,
                     timeout=3,
