@@ -115,6 +115,20 @@ class RuntimePathDefaultsTest(unittest.TestCase):
 
 
 class RuntimePathConfigTest(unittest.TestCase):
+    def test_systemd_connector_logs_use_gateway_log_directory(self):
+        from novena_gateway.tb_utility.tb_rotating_file_handler import TimedRotatingFileHandler
+
+        service = (REPO_ROOT / "novena-gateway.service").read_text()
+        self.assertIn("Environment=TB_GW_LOGS_PATH=/var/log/novena-gateway", service)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"TB_GW_LOGS_PATH": directory}):
+                handler = TimedRotatingFileHandler.get_connector_file_handler("Modbus TCP Connector")
+                try:
+                    self.assertEqual(Path(handler.baseFilename).parent, Path(directory))
+                    self.assertTrue(Path(handler.baseFilename).is_file())
+                finally:
+                    handler.close()
+
     def test_shipped_configs_use_var_lib_for_runtime_state(self):
         config_paths = [
             REPO_ROOT / "config.json",
