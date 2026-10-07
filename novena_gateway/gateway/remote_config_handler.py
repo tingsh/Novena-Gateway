@@ -349,7 +349,10 @@ class RemoteConfigHandler:
                 f"{item.get('name')}: {item.get('error') or item.get('status')}"
                 for item in failures
             )
-            rollback_config = self._read_last_known_good() or previous_config
+            # Roll back this transaction to the config that was active just
+            # before it. The persisted last-known-good snapshot can lag behind
+            # local MQTT credential rotation or a site network change.
+            rollback_config = previous_config
             self._write_config(rollback_config)
             self._gateway._stop_connectors()
             self._gateway._config = rollback_config

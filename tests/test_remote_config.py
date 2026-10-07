@@ -229,6 +229,35 @@ class TestRemoteConfigHandler(unittest.TestCase):
             "error",
         )
 
+    def test_failed_connector_update_preserves_newer_local_mqtt_settings(self):
+        failing_gateway = FailingStartGateway(config=dict(self.initial_config))
+        handler = RemoteConfigHandler(
+            gateway=failing_gateway,
+            publisher=self.mock_publisher,
+            serial_number="NF-TEST-001",
+            config_path=self.config_path,
+            config={
+                "enabled": True,
+                "backup_dir": self.backup_dir,
+                "config_journal_path": self.journal_path,
+            },
+        )
+        handler._ensure_last_known_good()
+        current_config = {
+            **self.initial_config,
+            "mqtt": {"host": "192.168.0.16", "port": 1883, "password": "rotated-secret"},
+        }
+        with open(self.config_path, "w") as config_file:
+            json.dump(current_config, config_file)
+
+        result = handler._apply_connector_update({"connectors": [{"type": "modbus", "name": "Broken Modbus"}]})
+
+        with open(self.config_path) as config_file:
+            restored = json.load(config_file)
+        self.assertEqual(result["config_update_status"], "rolled_back")
+        self.assertEqual(restored, current_config)
+        self.assertEqual(failing_gateway._config, current_config)
+
     def test_get_status_returns_last_update_result(self):
         result = self.handler._apply_full_update({
             "gateway": {"serial_number": "NF-NEW"},
