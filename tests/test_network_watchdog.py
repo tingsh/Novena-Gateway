@@ -140,6 +140,23 @@ Status |   state: 'connected'
             call("wwan0", 700)
         ])
 
+    @patch.object(NetworkWatchdogHandler, "_get_signal_strength", return_value=-60)
+    @patch.object(NetworkWatchdogHandler, "_ping_interface")
+    @patch.object(NetworkWatchdogHandler, "_is_interface_physically_up", return_value=False)
+    @patch.object(NetworkWatchdogHandler, "_set_interface_metric")
+    def test_failover_notifies_attribute_sync_after_releasing_status_lock(
+        self, mock_set_metric, mock_phys_up, mock_ping, mock_signal
+    ):
+        mock_ping.side_effect = lambda iface: iface == "wlan0"
+
+        def collect_during_notification():
+            self.assertTrue(self.handler._status_lock.acquire(blocking=False))
+            self.handler._status_lock.release()
+            self.assertEqual(self.handler.collect_watchdog_attributes()["active_interface"], "wlan0")
+
+        self.handler._notify_attribute_sync = collect_during_notification
+        self.handler._check_network()
+
     @patch.object(NetworkWatchdogHandler, "_ping_interface")
     @patch.object(NetworkWatchdogHandler, "_is_interface_physically_up")
     @patch.object(NetworkWatchdogHandler, "_set_interface_metric")

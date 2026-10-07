@@ -601,6 +601,8 @@ class NovenaGateway:
         log.info("Gateway is running. Press Ctrl+C to stop.")
 
         # Notify systemd that startup is complete
+        if not self._attribute_sync.healthy():
+            raise RuntimeError("Operational attribute heartbeat did not start")
         self._sd_notifier = sdnotify.SystemdNotifier()
         self._sd_notifier.notify("READY=1")
         log.info("Notified systemd: READY=1")
@@ -610,13 +612,16 @@ class NovenaGateway:
         try:
             while not self._stopped:
                 self.stop_event.wait(timeout=1.0)
+                if not self._stopped and not self._attribute_sync.healthy():
+                    log.error("Operational attribute heartbeat stopped; restarting Gateway")
+                    raise RuntimeError("Operational attribute heartbeat stopped")
                 if monotonic() - last_watchdog >= 60:
                     self._sd_notifier.notify("WATCHDOG=1")
                     last_watchdog = monotonic()
         except KeyboardInterrupt:
             pass
-
-        self.stop()
+        finally:
+            self.stop()
 
     def stop(self):
         """Gracefully shut down the gateway."""

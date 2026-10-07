@@ -71,6 +71,31 @@ class TestAttributeSyncHandler(unittest.TestCase):
         self.assertIn("attributes", payload)
         self.assertIn("ts", payload)
 
+    def test_missing_operational_heartbeat_is_unhealthy(self):
+        self.assertFalse(self.handler.healthy())
+        self.handler._publish_attributes()
+        self.handler._heartbeat_thread = MagicMock()
+        self.handler._heartbeat_thread.is_alive.return_value = True
+        self.assertTrue(self.handler.healthy())
+        self.handler._heartbeat_thread.is_alive.return_value = False
+        self.assertFalse(self.handler.healthy())
+
+    def test_connected_heartbeat_requires_broker_delivery(self):
+        self.mock_publisher.is_connected.return_value = True
+        self.mock_publisher.publish_attributes.return_value = False
+
+        with self.assertRaisesRegex(RuntimeError, "publish was rejected"):
+            self.handler._publish_attributes(verify_delivery=True)
+
+        self.mock_publisher.publish_attributes.assert_called_once()
+        self.assertTrue(self.mock_publisher.publish_attributes.call_args.kwargs["immediate"])
+        self.assertIsNone(self.handler._last_publish)
+
+    def test_disabled_attribute_sync_cannot_report_ready(self):
+        self.handler._enabled = False
+        with self.assertRaisesRegex(RuntimeError, "required"):
+            self.handler.start()
+
     def test_on_attribute_push(self):
         """Inbound attribute push should update local cloud_attributes."""
         self.handler._on_attribute_push("test/topic", {

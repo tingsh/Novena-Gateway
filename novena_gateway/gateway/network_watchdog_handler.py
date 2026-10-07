@@ -142,8 +142,13 @@ class NetworkWatchdogHandler:
                         self._execute_failover(wifi_ok, False)
 
             # If state changed, trigger attribute sync immediately
-            if previous_interface != self.active_interface or self.failover_count == 0:
-                self._notify_attribute_sync()
+            notify_attributes = previous_interface != self.active_interface or self.failover_count == 0
+
+        # Attribute collection reads watchdog status under the same lock.
+        # Publishing while holding it deadlocks the watchdog and all later
+        # operational heartbeats after a network failover.
+        if notify_attributes:
+            self._notify_attribute_sync()
 
     def _execute_failover(self, wifi_ok: bool, fourg_ok: bool):
         """Adjust route metrics to prioritize backup WAN."""

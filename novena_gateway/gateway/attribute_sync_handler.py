@@ -69,6 +69,7 @@ class AttributeSyncHandler:
         self._stopped = False
         self._heartbeat_thread = None
         self._start_time = monotonic()
+        self._last_publish = None
 
         # Inbound topic
         self._inbound_topic = f"v1/gateway/{self._serial_number}/attributes/request"
@@ -80,15 +81,14 @@ class AttributeSyncHandler:
     def start(self):
         """Start attribute sync: publish initial attributes and begin heartbeat."""
         if not self._enabled:
-            log.info("Attribute sync is disabled.")
-            return
+            raise RuntimeError("Attribute sync is required for gateway readiness")
 
         # Subscribe to inbound attribute pushes
         self._publisher.subscribe(self._inbound_topic, self._on_attribute_push)
         log.info("Subscribed to inbound attributes on: %s", self._inbound_topic)
 
         # Publish initial attributes
-        self._publish_attributes()
+        self._publish_attributes(verify_delivery=True)
 
         # Start heartbeat thread
         self._stopped = False
@@ -97,6 +97,15 @@ class AttributeSyncHandler:
         )
         self._heartbeat_thread.start()
         log.info("Attribute sync started (heartbeat every %ds)", self._heartbeat_interval)
+
+    def healthy(self) -> bool:
+        """Keep systemd readiness tied to the operational heartbeat worker."""
+        return bool(
+            self._heartbeat_thread
+            and self._heartbeat_thread.is_alive()
+            and self._last_publish is not None
+            and monotonic() - self._last_publish <= max(60, 2 * self._heartbeat_interval + 15)
+        )
 
     def stop(self):
         """Stop heartbeat and publish offline status."""
@@ -229,7 +238,7 @@ class AttributeSyncHandler:
             "ota_rollback_performed": payload.get("ota_rollback_performed", False),
         }
 
-    def _publish_attributes(self, status: str = "online"):
+    def _publish_attributes(self, status: str = "online", *, verify_delivery: bool = False):
         """Publish current gateway attributes to the cloud."""
         attributes = self._collect_attributes(status=status)
         payload = {
@@ -237,7 +246,14 @@ class AttributeSyncHandler:
             "ts": int(time() * 1000),
             "attributes": attributes,
         }
-        self._publisher.publish_attributes(payload)
+        # The normal publisher queues messages and reports success even if the
+        # queue later stalls. Startup and heartbeat reports require a broker
+        # acknowledgement when connected; other attribute replies may run in
+        # the MQTT callback thread and must stay asynchronous.
+        immediate = verify_delivery and self._publisher.is_connected()
+        if self._publisher.publish_attributes(payload, immediate=immediate) is False:
+            raise RuntimeError("Gateway attribute publish was rejected")
+        self._last_publish = monotonic()
         log.debug("Published gateway attributes: %s", attributes)
 
     def _heartbeat_loop(self):
@@ -247,7 +263,7 @@ class AttributeSyncHandler:
             if self._stopped:
                 break
             try:
-                self._publish_attributes()
+                self._publish_attributes(verify_delivery=True)
             except Exception as e:
                 log.error("Failed to publish heartbeat attributes: %s", e)
 
