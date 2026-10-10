@@ -27,6 +27,7 @@ from novena_gateway.gateway.runtime_paths import (
     COMMAND_JOURNAL_PATH,
     COMMAND_POLICY_PATH,
     CONFIG_JOURNAL_PATH,
+    DATA_DIR,
 )
 
 SERIAL = "NOV-AUDIT-FACTORY-HW"
@@ -64,11 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=1883,
         help="MQTT port. The hardware replay flow is fixed to 1883.",
     )
-    parser.add_argument(
-        "--mqtt-password",
-        required=True,
-        help="MQTT password / replay claim code. For this fixture use F157DFD4.",
-    )
+    parser.add_argument("--runtime-dir", type=Path, help=f"Isolated test state subdirectory beneath {DATA_DIR}.")
+    parser.add_argument("--serial", default=SERIAL, help="Factory inventory serial for this replay.")
+    credentials = parser.add_mutually_exclusive_group(required=True)
+    credentials.add_argument("--mqtt-password", help="Claim code; prefer --mqtt-password-file to avoid shell history.")
+    credentials.add_argument("--mqtt-password-file", type=Path, help="Mode-0600 file containing only the claim code.")
     parser.add_argument("--public-key-id", required=True, help="Hub Guided Setup signing key id.")
     parser.add_argument(
         "--public-key-b64",
@@ -89,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def require_real_value(name: str, value: str) -> None:
     if not value or value.startswith("REPLACE_") or "PASTE_" in value:
-        raise SystemExit(f"{name} still looks like a placeholder: {value!r}")
+        raise SystemExit(f"{name} is empty or still looks like a placeholder.")
 
 
 def backup_existing(path: Path) -> Path | None:
@@ -129,6 +130,19 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    if not args.serial or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for c in args.serial):
+        parser.error("serial must contain only letters, digits, hyphens and underscores")
+    if args.serial != SERIAL and (not args.runtime_dir or not args.runtime_dir.is_absolute()):
+        parser.error("a dedicated serial requires an absolute --runtime-dir")
+    if args.runtime_dir and (
+        not args.runtime_dir.is_absolute() or Path(DATA_DIR) not in args.runtime_dir.resolve().parents
+    ):
+        parser.error(f"runtime-dir must be an absolute subdirectory beneath {DATA_DIR}")
+    if args.mqtt_password_file:
+        if args.mqtt_password_file.stat().st_mode & 0o077:
+            parser.error("credential file must not be accessible to group or others")
+        args.mqtt_password = args.mqtt_password_file.read_text().strip()
+
     if args.mqtt_port != 1883:
         parser.error("the local hardware replay setup uses MQTT port 1883 only")
 
@@ -147,17 +161,17 @@ def main() -> int:
 
     cfg = json.loads(args.template.read_text())
     cfg.setdefault("deployment", {})["mode"] = "local"
-    cfg.setdefault("gateway", {})["serial_number"] = SERIAL
+    cfg.setdefault("gateway", {})["serial_number"] = args.serial
 
     mqtt = cfg.setdefault("mqtt", {})
     mqtt.update(
         {
             "host": args.mqtt_host,
             "port": 1883,
-            "topic": f"v1/gateway/{SERIAL}/telemetry",
-            "username": SERIAL,
+            "topic": f"v1/gateway/{args.serial}/telemetry",
+            "username": args.serial,
             "password": args.mqtt_password,
-            "client_id": f"novena-gateway-{SERIAL}",
+            "client_id": f"novena-gateway-{args.serial}",
             "allow_insecure_private_mqtt": True,
         }
     )
@@ -167,7 +181,7 @@ def main() -> int:
     bootstrap.update(
         {
             "enabled": True,
-            "username": f"bootstrap:{SERIAL}",
+            "username": f"bootstrap:{args.serial}",
             "password": args.mqtt_password,
         }
     )
@@ -213,6 +227,23 @@ def main() -> int:
         }
     )
 
+    if args.runtime_dir:
+        paths = {
+            ("storage", "sqlite", "data_file_path"): "sqlite/",
+            ("storage", "update_path"): "updates",
+            ("storage", "ota_status_path"): "ota-status.json",
+            ("features", "remote_config", "backup_dir"): "config-backups",
+            ("features", "remote_config", "last_known_good_path"): "last-known-good.json",
+            ("features", "remote_config", "config_journal_path"): "config-journal.json",
+            ("features", "rpc", "command_policy_path"): "command-policy.json",
+            ("features", "rpc", "command_journal_path"): "command-journal.json",
+        }
+        for keys, filename in paths.items():
+            destination = cfg
+            for key in keys[:-1]:
+                destination = destination.setdefault(key, {})
+            destination[keys[-1]] = str(args.runtime_dir / filename) + ("/" if filename.endswith("/") else "")
+
     cfg["connectors"] = []
 
     backup = None if args.no_backup else backup_existing(args.output)
@@ -221,9 +252,9 @@ def main() -> int:
     print(f"Wrote Gateway config: {args.output}")
     if backup:
         print(f"Backed up previous config: {backup}")
-    print(f"Gateway serial: {SERIAL}")
+    print(f"Gateway serial: {args.serial}")
     print(f"MQTT target: {args.mqtt_host}:1883")
-    print(f"MQTT username: {SERIAL}")
+    print(f"MQTT username: {args.serial}")
     print("MQTT password: [set]")
     print(f"Guided Setup key id: {args.public_key_id}")
     print(f"Guided Setup public key: {args.public_key_b64[:8]}...{args.public_key_b64[-8:]}")
