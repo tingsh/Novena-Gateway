@@ -69,7 +69,9 @@
       "mode": "auto",
       "eth_interface": "eth0",
       "wifi_interface": "wlan0",
-      "fourg_interface": "wwan0"
+      "fourg_interface": "wwan0",
+      "interface_roles": {},
+      "health_targets": ["8.8.8.8"]
     },
     "remote_config": {
       "enabled": true,

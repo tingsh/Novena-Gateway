@@ -54,6 +54,15 @@
       "interval_seconds": 60,
       "timeout_seconds": 5
     },
+    "network_watchdog": {
+      "enabled": true,
+      "mode": "auto",
+      "eth_interface": "eth0",
+      "wifi_interface": "wlan0",
+      "fourg_interface": "wwan0",
+      "interface_roles": {"eth0": "field", "wlan0": "uplink"},
+      "health_targets": ["8.8.8.8"]
+    },
     "remote_config": {
       "enabled": true,
       "backup_dir": "/var/lib/novena-gateway/config_backups",
