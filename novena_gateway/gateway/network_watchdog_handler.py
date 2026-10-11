@@ -133,7 +133,7 @@ class NetworkWatchdogHandler:
             return False
 
     @staticmethod
-    def _nm_profile(interface: str) -> tuple[str, int] | None:
+    def _nm_profile(interface: str) -> Optional[tuple[str, int]]:
         """Resolve the active UUID, never assume an interface is a profile name."""
         try:
             uuid_result = subprocess.run(
