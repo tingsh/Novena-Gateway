@@ -13,7 +13,7 @@ import signal
 import sys
 from queue import SimpleQueue
 from threading import Event, Thread
-from time import monotonic, sleep, time
+from time import monotonic, time
 
 import sdnotify
 
@@ -238,6 +238,34 @@ class NovenaGateway:
                         errors.append(f"mqtt.tls.{key} — file not found: {val}")
 
         NovenaGateway._validate_runtime_state_paths(config, errors)
+        watchdog = config.get("features", {}).get("network_watchdog", {})
+        if not isinstance(watchdog, dict):
+            errors.append("features.network_watchdog — must be an object")
+        else:
+            if watchdog.get("mode", "auto") not in ("auto", "active", "diagnostic"):
+                errors.append("features.network_watchdog.mode — use auto, active, or diagnostic")
+            interfaces = [watchdog.get(key, default) for key, default in (
+                ("eth_interface", "eth0"), ("wifi_interface", "wlan0"),
+                ("fourg_interface", "wwan0"),
+            ) if watchdog.get(key, default)]
+            if len(interfaces) != len(set(interfaces)):
+                errors.append("features.network_watchdog interfaces — must be distinct")
+            roles = watchdog.get("interface_roles", {})
+            if not isinstance(roles, dict) or any(
+                interface not in interfaces or role not in ("uplink", "field")
+                for interface, role in (roles.items() if isinstance(roles, dict) else ())
+            ):
+                errors.append("features.network_watchdog.interface_roles — map configured interfaces to uplink or field")
+            targets = watchdog.get("health_targets", [watchdog.get("ping_target", "8.8.8.8")])
+            if not isinstance(targets, list) or not targets or any(
+                not isinstance(target, str) or not target or target.startswith("-") or len(target) > 253
+                for target in targets
+            ):
+                errors.append("features.network_watchdog.health_targets — use a nonempty list of hostnames or IPs")
+            for key in ("ping_interval_seconds", "ping_timeout_seconds"):
+                value = watchdog.get(key, 15 if key == "ping_interval_seconds" else 3)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 300:
+                    errors.append(f"features.network_watchdog.{key} — use an integer from 1 to 300")
 
         return errors
 

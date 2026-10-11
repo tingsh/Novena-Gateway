@@ -1,56 +1,48 @@
+"""Role-aware, conservative network uplink monitoring for the Gateway."""
+
 import logging
+import re
 import subprocess
 import threading
 import time
 from typing import Optional
+
 from novena_gateway.gateway.privileged_helper import PrivilegedCommandRunner
 
 log = logging.getLogger("novena_gateway.network_watchdog")
+_UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
 class NetworkWatchdogHandler:
-    """
-    Actively monitors gateway internet connectivity using a 3-tier Multi-WAN hierarchy.
-    Manages dynamic route metric manipulation via nmcli when a zombie link is detected,
-    and handles graceful fallback to primary Ethernet when connectivity heals.
-    """
+    """Monitor eligible uplinks without touching private equipment networks."""
 
     def __init__(self, gateway, config: Optional[dict] = None):
         self._gateway = gateway
         self._config = config or {}
-
         self._enabled = self._config.get("enabled", True)
         self._requested_mode = self._config.get("mode", "auto")
         self._helper = PrivilegedCommandRunner(self._config.get("helper_path"))
         self._watchdog_mode = self._resolve_mode()
-        self._ping_target = self._config.get("ping_target", "8.8.8.8")
+        self._targets = self._config.get("health_targets", [self._config.get("ping_target", "8.8.8.8")])
         self._ping_interval = self._config.get("ping_interval_seconds", 15)
         self._ping_timeout = self._config.get("ping_timeout_seconds", 3)
-
-        # Interface definitions
         self._eth_iface = self._config.get("eth_interface", "eth0")
         self._wifi_iface = self._config.get("wifi_interface", "wlan0")
         self._fourg_iface = self._config.get("fourg_interface", "wwan0")
-
-        # Default route metrics
-        self._eth_metric = self._config.get("eth_metric", 100)
-        self._wifi_metric = self._config.get("wifi_metric", 600)
-        self._fourg_metric = self._config.get("fourg_metric", 700)
-
-        # Watchdog status state
-        self.active_interface = self._eth_iface
+        self._interfaces = [i for i in (self._eth_iface, self._wifi_iface, self._fourg_iface) if i]
+        self._roles = self._config.get("interface_roles", {})
+        self.active_interface = ""
         self.failover_count = 0
         self.ethernet_status = "unknown"
         self.wifi_status = "unknown"
         self.fourg_status = "unknown"
         self.signal_strength = None
-
+        self.interface_diagnostics = {}
+        self._original_metrics = {}
         self._stopped = False
         self._watchdog_thread = None
         self._status_lock = threading.Lock()
-
-        # Track consecutive failures or successes for healing
-        self._consecutive_eth_successes = 0
+        self._consecutive_preferred_successes = 0
 
     def _resolve_mode(self) -> str:
         if self._requested_mode == "diagnostic":
@@ -62,198 +54,251 @@ class NetworkWatchdogHandler:
         return "active" if self._helper.available() else "diagnostic"
 
     def start(self):
-        """Start the watchdog thread."""
         if not self._enabled:
             log.info("Network watchdog is disabled.")
             return
-
         self._stopped = False
         self._watchdog_mode = self._resolve_mode()
-        self._watchdog_thread = threading.Thread(
-            target=self._watchdog_loop, name="NetWatchdog", daemon=True
-        )
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, name="NetWatchdog", daemon=True)
         self._watchdog_thread.start()
-        log.info("Network watchdog daemon started.")
+        log.info("Network watchdog started in %s mode", self._watchdog_mode)
 
     def stop(self):
-        """Stop the watchdog thread and restore default metrics."""
         self._stopped = True
         if self._watchdog_thread and self._watchdog_thread.is_alive():
-            self._watchdog_thread.join(timeout=3)
-        if self._watchdog_mode == "active":
-            self._restore_default_metrics()
-        log.info("Network watchdog daemon stopped.")
+            self._watchdog_thread.join(timeout=30)
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            log.warning("Watchdog still running; deferring metric restoration")
+            return
+        self._restore_metrics()
+        log.info("Network watchdog stopped")
 
     def _watchdog_loop(self):
-        """Periodically run network interface checks."""
         while not self._stopped:
             try:
                 self._check_network()
-            except Exception as e:
-                log.exception("Error checking network status: %s", e)
-
-            # Sleep in small increments to allow responsive shutdown
+            except Exception:
+                log.exception("Error checking network status")
             for _ in range(self._ping_interval):
                 if self._stopped:
                     break
                 time.sleep(1)
 
-    def _check_network(self):
-        """Perform ping checks, run state machine, and handle metric changes."""
-        # 1. Update interface statuses
-        eth_ok = self._ping_interface(self._eth_iface)
-        wifi_ok = self._ping_interface(self._wifi_iface)
-        fourg_ok = self._ping_interface(self._fourg_iface)
+    @staticmethod
+    def _default_routes() -> dict:
+        """Read kernel IPv4 defaults, including backup routes with higher metrics."""
+        routes = {}
+        try:
+            with open("/proc/net/route", encoding="ascii") as route_file:
+                next(route_file)
+                for line in route_file:
+                    fields = line.split()
+                    if len(fields) < 8 or fields[1] != "00000000" or fields[7] != "00000000":
+                        continue
+                    if not (int(fields[3], 16) & 1):
+                        continue
+                    metric = int(fields[6])
+                    routes[fields[0]] = min(metric, routes.get(fields[0], metric))
+        except (OSError, ValueError, StopIteration) as exc:
+            log.warning("Cannot inspect default routes: %s", exc)
+        return routes
 
-        self.signal_strength = self._get_signal_strength()
-
-        with self._status_lock:
-            # Check physical state vs ping state to identify zombie
-            self.ethernet_status = "up" if eth_ok else ("zombie" if self._is_interface_physically_up(self._eth_iface) else "down")
-            self.wifi_status = "up" if wifi_ok else ("down" if self._is_interface_physically_up(self._wifi_iface) else "disconnected")
-            self.fourg_status = "up" if fourg_ok else ("down" if self._is_interface_physically_up(self._fourg_iface) else "disconnected")
-
-            previous_interface = self.active_interface
-
-            # State machine for failover and recovery
-            if self.active_interface == self._eth_iface:
-                if not eth_ok:
-                    log.warning("Ethernet connection failed (Status: %s). Initiating failover.", self.ethernet_status)
-                    self._consecutive_eth_successes = 0
-                    self._execute_failover(wifi_ok, fourg_ok)
-            else:
-                # We are in failover mode on wifi or 4g. Test ethernet for recovery.
-                if eth_ok:
-                    self._consecutive_eth_successes += 1
-                    if self._consecutive_eth_successes >= 3:
-                        log.info("Ethernet connectivity has stabilized. Failing back to primary Ethernet.")
-                        self._restore_default_metrics()
-                        self.active_interface = self._eth_iface
-                        self.failover_count += 1
-                else:
-                    self._consecutive_eth_successes = 0
-
-                    # If current interface fails, check if we need to switch between backup interfaces
-                    if self.active_interface == self._wifi_iface and not wifi_ok:
-                        log.warning("Secondary Wi-Fi failed. Checking tertiary 4G.")
-                        self._execute_failover(False, fourg_ok)
-                    elif self.active_interface == self._fourg_iface and not fourg_ok and wifi_ok:
-                        log.warning("Tertiary 4G failed, but Wi-Fi is back. Switching to Wi-Fi.")
-                        self._execute_failover(wifi_ok, False)
-
-            # If state changed, trigger attribute sync immediately
-            notify_attributes = previous_interface != self.active_interface or self.failover_count == 0
-
-        # Attribute collection reads watchdog status under the same lock.
-        # Publishing while holding it deadlocks the watchdog and all later
-        # operational heartbeats after a network failover.
-        if notify_attributes:
-            self._notify_attribute_sync()
-
-    def _execute_failover(self, wifi_ok: bool, fourg_ok: bool):
-        """Adjust route metrics to prioritize backup WAN."""
-        if wifi_ok:
-            log.info("Failing over to Secondary Wi-Fi (%s)", self._wifi_iface)
-            self._set_interface_metric(self._wifi_iface, 50)  # Metric 50 beats Ethernet metric 100
-            self._set_interface_metric(self._fourg_iface, self._fourg_metric)
-            self.active_interface = self._wifi_iface
-            self.failover_count += 1
-        elif fourg_ok:
-            log.info("Failing over to Fallback 4G/LTE (%s)", self._fourg_iface)
-            self._set_interface_metric(self._fourg_iface, 50)  # Metric 50 beats Ethernet metric 100
-            self._set_interface_metric(self._wifi_iface, self._wifi_metric)
-            self.active_interface = self._fourg_iface
-            self.failover_count += 1
-        else:
-            log.error("All internet interfaces are offline! Keeping default metrics.")
-            self._restore_default_metrics()
-            self.active_interface = self._eth_iface
-
-    def _restore_default_metrics(self):
-        """Restore default route metrics for all WAN connections."""
-        log.info("Restoring default route metrics (Eth=%d, WiFi=%d, 4G=%d)",
-                 self._eth_metric, self._wifi_metric, self._fourg_metric)
-        self._set_interface_metric(self._eth_iface, self._eth_metric)
-        self._set_interface_metric(self._wifi_iface, self._wifi_metric)
-        self._set_interface_metric(self._fourg_iface, self._fourg_metric)
+    def _role(self, interface: str, routes: dict) -> tuple[str, str]:
+        configured = self._roles.get(interface)
+        if configured:
+            return configured, "configured"
+        if interface in routes:
+            return "uplink", "default_route"
+        return "field", "no_default_route"
 
     def _ping_interface(self, interface: str) -> bool:
-        """Run an interface-bound ping connectivity test."""
-        if not interface:
-            return False
-        try:
-            res = subprocess.run(
-                ["ping", "-c", "1", "-W", str(self._ping_timeout), "-I", interface, self._ping_target],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=self._ping_timeout + 1
-            )
-            return res.returncode == 0
-        except Exception:
-            return False
+        for target in self._targets:
+            try:
+                result = subprocess.run(
+                    ["ping", "-c", "1", "-W", str(self._ping_timeout), "-I", interface, target],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=self._ping_timeout + 1,
+                )
+                if result.returncode == 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return False
 
     def _is_interface_physically_up(self, interface: str) -> bool:
-        """Check if interface operstate is up."""
         try:
-            with open(f"/sys/class/net/{interface}/operstate", "r") as f:
-                state = f.read().strip()
-                return state != "down"
-        except Exception:
+            with open(f"/sys/class/net/{interface}/operstate", encoding="ascii") as state_file:
+                return state_file.read().strip() == "up"
+        except OSError:
             return False
 
-    def _set_interface_metric(self, interface: str, metric: int):
-        """Issue nmcli connection modification and reload interface."""
-        if not interface:
-            return
-        log.info("Setting route metric for %s to %d", interface, metric)
-        if self._watchdog_mode != "active":
-            log.info("Network watchdog is in diagnostic mode; not changing route metric.")
-            return
+    @staticmethod
+    def _nm_profile(interface: str) -> Optional[tuple[str, int]]:
+        """Resolve the active UUID, never assume an interface is a profile name."""
         try:
-            result = self._helper.set_route_metric(interface, metric)
-            if not result.get("ok"):
-                raise RuntimeError(result.get("stderr") or "privileged helper failed")
-        except Exception as e:
-            log.warning("Failed to modify route metric for %s to %d: %s", interface, metric, e)
+            uuid_result = subprocess.run(
+                ["nmcli", "-g", "GENERAL.CON-UUID", "device", "show", interface],
+                capture_output=True, text=True, timeout=3,
+            )
+            uuid = uuid_result.stdout.strip()
+            if uuid_result.returncode or not _UUID.fullmatch(uuid):
+                return None
+            metric_result = subprocess.run(
+                ["nmcli", "-g", "ipv4.route-metric", "connection", "show", "uuid", uuid],
+                capture_output=True, text=True, timeout=3,
+            )
+            if metric_result.returncode:
+                return None
+            return uuid, int(metric_result.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+    def _set_interface_metric(self, interface: str, metric: int) -> bool:
+        if self._watchdog_mode != "active":
+            return True
+        profile = self._nm_profile(interface)
+        if not profile:
+            log.warning("No active NetworkManager profile for uplink %s; route unchanged", interface)
+            return False
+        uuid, original = profile
+        result = self._helper.set_route_metric(interface, uuid, metric)
+        if not result.get("ok"):
+            log.warning("Metric change for %s (%s) failed: %s", interface, uuid, result.get("stderr"))
+            return False
+        self._original_metrics.setdefault(interface, (uuid, original))
+        return True
+
+    def _restore_metrics(self):
+        if self._watchdog_mode != "active":
+            return
+        for interface, (uuid, metric) in list(self._original_metrics.items()):
+            profile = self._nm_profile(interface)
+            if not profile or profile[0] != uuid:
+                log.warning("Profile changed on %s; skipping metric restoration", interface)
+                continue
+            result = self._helper.set_route_metric(interface, uuid, metric)
+            if result.get("ok"):
+                del self._original_metrics[interface]
+            else:
+                log.warning("Could not restore metric on %s: %s", interface, result.get("stderr"))
+
+    def _check_network(self):
+        routes = self._default_routes()
+        diagnostics = {}
+        for interface in self._interfaces:
+            role, reason = self._role(interface, routes)
+            physical = self._is_interface_physically_up(interface)
+            eligible = role == "uplink" and interface in routes
+            probe_ok = self._ping_interface(interface) if eligible and physical else None
+            diagnostics[interface] = {
+                "role": role, "role_reason": reason, "physical_up": physical,
+                "default_route": interface in routes, "probe_ok": probe_ok,
+                "status": (
+                    "field" if role == "field" else
+                    "no_default_route" if not eligible else
+                    "down" if not physical else
+                    "up" if probe_ok else "probe_failed"
+                ),
+            }
+        healthy = [i for i in self._interfaces if diagnostics[i]["probe_ok"]]
+        preferred = healthy[0] if healthy else ""
+        with self._status_lock:
+            current = self.active_interface
+        initial = not current
+        if initial:
+            routed_uplinks = [i for i in self._interfaces if i in routes and diagnostics[i]["role"] == "uplink"]
+            current = min(routed_uplinks, key=routes.get) if routed_uplinks else ""
+        # A primary must recover for three checks before preempting a healthy backup.
+        candidate = current
+        if current not in healthy:
+            candidate = preferred
+            self._consecutive_preferred_successes = 0
+        elif preferred and preferred != current:
+            self._consecutive_preferred_successes += 1
+            if self._consecutive_preferred_successes >= 3:
+                candidate = preferred
+        else:
+            self._consecutive_preferred_successes = 0
+
+        changed = bool(initial and current)
+        if candidate and candidate != current:
+            # The selected uplink already owns the best default route: no mutation needed.
+            selected_metric = routes.get(candidate)
+            other_metrics = [routes[i] for i in self._interfaces if i != candidate and i in routes and diagnostics[i]["role"] == "uplink"]
+            needs_metric = bool(other_metrics and selected_metric >= min(other_metrics))
+            success = not needs_metric or (
+                self._watchdog_mode == "active"
+                and min(other_metrics) > 0
+                and self._set_interface_metric(candidate, min(other_metrics) - 1)
+            )
+            if success:
+                with self._status_lock:
+                    self.active_interface = candidate
+                    if current and needs_metric:
+                        self.failover_count += 1
+                changed = True
+            else:
+                diagnostics[candidate]["action_error"] = "metric_change_failed"
+                if initial and current:
+                    with self._status_lock:
+                        self.active_interface = current
+        elif not candidate and current:
+            with self._status_lock:
+                self.active_interface = ""
+            changed = True
+        elif initial and current:
+            with self._status_lock:
+                self.active_interface = current
+
+        # Restore only uplinks no longer selected, never a field interface.
+        for interface in list(self._original_metrics):
+            if interface != self.active_interface:
+                if diagnostics.get(interface, {}).get("role") != "uplink":
+                    continue
+                uuid, metric = self._original_metrics[interface]
+                profile = self._nm_profile(interface)
+                if profile and profile[0] == uuid:
+                    result = self._helper.set_route_metric(interface, uuid, metric)
+                    if result.get("ok"):
+                        del self._original_metrics[interface]
+        signal = self._get_signal_strength()
+        with self._status_lock:
+            self.interface_diagnostics = diagnostics
+            self.ethernet_status = diagnostics.get(self._eth_iface, {}).get("status", "disconnected")
+            self.wifi_status = diagnostics.get(self._wifi_iface, {}).get("status", "disconnected")
+            self.fourg_status = diagnostics.get(self._fourg_iface, {}).get("status", "disconnected")
+            self.signal_strength = signal
+        if changed:
+            self._notify_attribute_sync()
 
     def _get_signal_strength(self) -> Optional[int]:
-        """Try mmcli and nmcli to fetch active signal strength."""
         try:
             res = subprocess.run(["mmcli", "-m", "any", "--simple-status"], capture_output=True, text=True, timeout=2)
             if res.returncode == 0:
                 for line in res.stdout.splitlines():
                     if "signal quality" in line:
-                        parts = line.split(":")
-                        if len(parts) > 1:
-                            val = parts[1].strip().strip("'\"").replace("%", "")
-                            pct = int(val)
-                            return int((pct / 2) - 100)
-        except Exception:
+                        pct = int(line.split(":", 1)[1].strip().strip("'\"%").strip())
+                        return int((pct / 2) - 100)
+        except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
             pass
-
         try:
             res = subprocess.run(["nmcli", "-t", "-f", "active,signal", "device", "wifi"], capture_output=True, text=True, timeout=2)
             if res.returncode == 0:
                 for line in res.stdout.splitlines():
                     if line.startswith("yes:"):
-                        val = line.split(":")[1]
-                        pct = int(val)
-                        return int((pct / 2) - 100)
-        except Exception:
+                        return int((int(line.split(":", 1)[1]) / 2) - 100)
+        except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
             pass
-
-        return -70  # default fallback
+        return None
 
     def _notify_attribute_sync(self):
-        """Proactively trigger attribute synchronizer heartbeat publish."""
         try:
-            if hasattr(self._gateway, "_attribute_sync") and self._gateway._attribute_sync:
+            if getattr(self._gateway, "_attribute_sync", None):
                 self._gateway._attribute_sync._publish_attributes()
-        except Exception as e:
-            log.warning("Failed to trigger proactive attribute publish: %s", e)
+        except Exception as exc:
+            log.warning("Failed to trigger proactive attribute publish: %s", exc)
 
     def collect_watchdog_attributes(self) -> dict:
-        """Returns current watchdog status values for MQTT attribute serialization."""
         with self._status_lock:
             return {
                 "active_interface": self.active_interface,
@@ -264,4 +309,5 @@ class NetworkWatchdogHandler:
                 "signal_strength": self.signal_strength,
                 "watchdog_mode": self._watchdog_mode,
                 "privilege_helper_available": self._helper.available(),
+                "interface_diagnostics": dict(self.interface_diagnostics),
             }

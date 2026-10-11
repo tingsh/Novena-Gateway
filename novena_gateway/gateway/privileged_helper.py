@@ -65,8 +65,8 @@ class PrivilegedCommandRunner:
     def restart_service(self, service_name: str = "novena-gateway") -> dict:
         return self.run("restart-service", service_name, timeout=10)
 
-    def set_route_metric(self, interface: str, metric: int) -> dict:
-        return self.run("set-route-metric", interface, int(metric), timeout=20)
+    def set_route_metric(self, interface: str, profile_uuid: str, metric: int) -> dict:
+        return self.run("set-route-metric", interface, profile_uuid, int(metric), timeout=20)
 
     def configure_can(self, interface: str = "can0", bitrate: int = 500000) -> dict:
         return self.run("configure-can", interface, int(bitrate), timeout=20)

@@ -1,224 +1,175 @@
-"""Unit tests for the NetworkWatchdogHandler."""
+"""Regression coverage for Gateway field networks and uplink failover."""
 
-import sys
 import os
+import subprocess
+import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, call
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from novena_gateway.gateway.network_watchdog_handler import NetworkWatchdogHandler
 
-
-class MockGateway:
-    def __init__(self):
-        self._attribute_sync = MagicMock()
+UUID = "11111111-2222-3333-4444-555555555555"
 
 
 class TestNetworkWatchdogHandler(unittest.TestCase):
-
     def setUp(self):
-        self.mock_gateway = MockGateway()
-        self.config = {
-            "enabled": True,
-            "ping_target": "8.8.8.8",
-            "ping_interval_seconds": 1,
-            "ping_timeout_seconds": 1,
-            "eth_interface": "eth0",
-            "wifi_interface": "wlan0",
-            "fourg_interface": "wwan0",
-            "eth_metric": 100,
-            "wifi_metric": 600,
-            "fourg_metric": 700
-        }
-        self.handler = NetworkWatchdogHandler(self.mock_gateway, self.config)
-
-    @patch("subprocess.run")
-    def test_ping_interface_success(self, mock_run):
-        """Test ping_interface returns True on success."""
-        mock_run.return_value = MagicMock(returncode=0)
-        
-        result = self.handler._ping_interface("eth0")
-        
-        self.assertTrue(result)
-        mock_run.assert_called_once_with(
-            ["ping", "-c", "1", "-W", "1", "-I", "eth0", "8.8.8.8"],
-            stdout=subprocess_devnull(),
-            stderr=subprocess_devnull(),
-            timeout=2
-        )
-
-    @patch("subprocess.run")
-    def test_ping_interface_failure(self, mock_run):
-        """Test ping_interface returns False on failure."""
-        mock_run.return_value = MagicMock(returncode=1)
-        
-        result = self.handler._ping_interface("eth0")
-        
-        self.assertFalse(result)
-
-    @patch("builtins.open")
-    def test_is_interface_physically_up(self, mock_open):
-        """Test physically up detection based on operstate."""
-        # Setup mock file read
-        mock_file = MagicMock()
-        mock_file.read.return_value = "up\n"
-        mock_open.return_value.__enter__.return_value = mock_file
-
-        self.assertTrue(self.handler._is_interface_physically_up("eth0"))
-
-        mock_file.read.return_value = "down\n"
-        self.assertFalse(self.handler._is_interface_physically_up("eth0"))
-
-    def test_set_interface_metric(self):
-        """Setting interface route metric calls the privileged helper in active mode."""
+        self.gateway = MagicMock()
+        self.handler = NetworkWatchdogHandler(self.gateway, {
+            "eth_interface": "eth0", "wifi_interface": "wlan0", "fourg_interface": "wwan0",
+            "health_targets": ["8.8.8.8", "1.1.1.1"],
+        })
         self.handler._watchdog_mode = "active"
         self.handler._helper = MagicMock()
         self.handler._helper.set_route_metric.return_value = {"ok": True}
+        self.route = patch.object(self.handler, "_default_routes", return_value={"wlan0": 600})
+        self.physical = patch.object(self.handler, "_is_interface_physically_up", return_value=True)
+        self.ping = patch.object(self.handler, "_ping_interface", return_value=True)
+        self.signal = patch.object(self.handler, "_get_signal_strength", return_value=-60)
+        for mock_patch in (self.route, self.physical, self.ping, self.signal):
+            mock_patch.start()
+            self.addCleanup(mock_patch.stop)
 
-        self.handler._set_interface_metric("wlan0", 50)
-
-        self.handler._helper.set_route_metric.assert_called_once_with("wlan0", 50)
-
-    def test_set_interface_metric_diagnostic_mode_does_not_mutate(self):
-        self.handler._watchdog_mode = "diagnostic"
-        self.handler._helper = MagicMock()
-
-        self.handler._set_interface_metric("wlan0", 50)
-
+    def test_field_ethernet_is_never_probed_or_modified(self):
+        self.handler._check_network()
+        attrs = self.handler.collect_watchdog_attributes()
+        self.assertEqual(attrs["active_interface"], "wlan0")
+        self.assertEqual(attrs["ethernet_status"], "field")
+        self.assertEqual(attrs["interface_diagnostics"]["eth0"]["role_reason"], "no_default_route")
+        self.handler._ping_interface.assert_called_once_with("wlan0")
         self.handler._helper.set_route_metric.assert_not_called()
+        self.gateway._attribute_sync._publish_attributes.assert_called_once()
 
-    @patch("subprocess.run")
-    def test_get_signal_strength_cellular(self, mock_run):
-        """Test retrieving signal strength from cellular modem mmcli output."""
-        mock_res = MagicMock(returncode=0, stdout="""
--------------------------
-Status |   state: 'connected'
-       |   signal quality: '80%'
-""")
-        mock_run.return_value = mock_res
-        
-        signal = self.handler._get_signal_strength()
-        # Quality 80% -> dBm = (80 / 2) - 100 = -60
-        self.assertEqual(signal, -60)
-
-    @patch("subprocess.run")
-    def test_get_signal_strength_wifi(self, mock_run):
-        """Test retrieving signal strength from Wi-Fi nmcli output as fallback."""
-        # 1st call for mmcli fails/errors
-        # 2nd call for nmcli succeeds
-        def run_side_effect(cmd, *args, **kwargs):
-            if "mmcli" in cmd:
-                raise FileNotFoundError()
-            return MagicMock(returncode=0, stdout="yes:70\n")
-        
-        mock_run.side_effect = run_side_effect
-        
-        signal = self.handler._get_signal_strength()
-        # Quality 70% -> dBm = (70 / 2) - 100 = -65
-        self.assertEqual(signal, -65)
-
-    @patch.object(NetworkWatchdogHandler, "_ping_interface")
-    @patch.object(NetworkWatchdogHandler, "_is_interface_physically_up")
-    @patch.object(NetworkWatchdogHandler, "_set_interface_metric")
-    def test_failover_to_wifi(self, mock_set_metric, mock_phys_up, mock_ping):
-        """If primary Ethernet fails but Wi-Fi succeeds, failover to Wi-Fi."""
-        # eth ping fails, wifi ping succeeds, 4g ping succeeds
-        mock_ping.side_effect = lambda iface: iface != "eth0"
-        mock_phys_up.return_value = True  # Ethernet physically connected
-
-        self.handler._check_network()
-
-        self.assertEqual(self.handler.active_interface, "wlan0")
-        self.assertEqual(self.handler.ethernet_status, "zombie")
-        self.assertEqual(self.handler.wifi_status, "up")
-        self.assertEqual(self.handler.failover_count, 1)
-
-        # Should modify wifi metric to 50 and keep fallback 4g at 700
-        mock_set_metric.assert_has_calls([
-            call("wlan0", 50),
-            call("wwan0", 700)
-        ])
-
-    @patch.object(NetworkWatchdogHandler, "_get_signal_strength", return_value=-60)
-    @patch.object(NetworkWatchdogHandler, "_ping_interface")
-    @patch.object(NetworkWatchdogHandler, "_is_interface_physically_up", return_value=False)
-    @patch.object(NetworkWatchdogHandler, "_set_interface_metric")
-    def test_failover_notifies_attribute_sync_after_releasing_status_lock(
-        self, mock_set_metric, mock_phys_up, mock_ping, mock_signal
-    ):
-        mock_ping.side_effect = lambda iface: iface == "wlan0"
-
-        def collect_during_notification():
-            self.assertTrue(self.handler._status_lock.acquire(blocking=False))
-            self.handler._status_lock.release()
-            self.assertEqual(self.handler.collect_watchdog_attributes()["active_interface"], "wlan0")
-
-        self.handler._notify_attribute_sync = collect_during_notification
-        self.handler._check_network()
-
-    @patch.object(NetworkWatchdogHandler, "_ping_interface")
-    @patch.object(NetworkWatchdogHandler, "_is_interface_physically_up")
-    @patch.object(NetworkWatchdogHandler, "_set_interface_metric")
-    def test_failover_to_4g(self, mock_set_metric, mock_phys_up, mock_ping):
-        """If Ethernet and Wi-Fi fail but 4G succeeds, failover to 4G."""
-        # eth fails, wifi fails, 4g succeeds
-        mock_ping.side_effect = lambda iface: iface == "wwan0"
-        mock_phys_up.return_value = True
-
-        self.handler._check_network()
-
-        self.assertEqual(self.handler.active_interface, "wwan0")
-        self.assertEqual(self.handler.ethernet_status, "zombie")
-        self.assertEqual(self.handler.wifi_status, "down")
-        self.assertEqual(self.handler.fourg_status, "up")
-        self.assertEqual(self.handler.failover_count, 1)
-
-        # Should modify 4G metric to 50 and restore wifi to 600
-        mock_set_metric.assert_has_calls([
-            call("wwan0", 50),
-            call("wlan0", 600)
-        ])
-
-    @patch.object(NetworkWatchdogHandler, "_ping_interface")
-    @patch.object(NetworkWatchdogHandler, "_is_interface_physically_up")
-    @patch.object(NetworkWatchdogHandler, "_set_interface_metric")
-    def test_healing_and_fallback(self, mock_set_metric, mock_phys_up, mock_ping):
-        """Test that Ethernet connection recovery restores default metrics after 3 successes."""
-        # Start in failover on wlan0
-        self.handler.active_interface = "wlan0"
-        self.handler.failover_count = 1
-        
-        # Pings: eth OK, wifi OK, 4g OK
-        mock_ping.return_value = True
-        mock_phys_up.return_value = True
-
-        # First success
+    def test_explicit_field_role_wins_even_with_default_route(self):
+        self.handler._roles = {"eth0": "field"}
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 600}
         self.handler._check_network()
         self.assertEqual(self.handler.active_interface, "wlan0")
-        self.assertEqual(self.handler._consecutive_eth_successes, 1)
+        self.assertEqual(self.handler.interface_diagnostics["eth0"]["role_reason"], "configured")
+        self.handler._ping_interface.assert_called_once_with("wlan0")
 
-        # Second success
-        self.handler._check_network()
-        self.assertEqual(self.handler.active_interface, "wlan0")
-        self.assertEqual(self.handler._consecutive_eth_successes, 2)
-
-        # Third success: triggers fallback
+    def test_ethernet_uplink_and_wifi_recovery(self):
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 600}
         self.handler._check_network()
         self.assertEqual(self.handler.active_interface, "eth0")
+        self.handler._ping_interface.side_effect = lambda iface: iface == "wlan0"
+        with patch.object(self.handler, "_nm_profile", return_value=(UUID, -1)):
+            self.handler._check_network()
+        self.assertEqual(self.handler.active_interface, "wlan0")
+        self.assertEqual(self.handler.failover_count, 1)
+        self.handler._helper.set_route_metric.assert_called_with("wlan0", UUID, 99)
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 99}
+        self.handler._ping_interface.side_effect = lambda iface: True
+        with patch.object(self.handler, "_nm_profile", return_value=(UUID, -1)):
+            for _ in range(3):
+                self.handler._check_network()
+        self.assertEqual(self.handler.active_interface, "eth0")
         self.assertEqual(self.handler.failover_count, 2)
+        self.handler._helper.set_route_metric.assert_any_call("wlan0", UUID, -1)
 
-        # Verify metrics restored to default
-        mock_set_metric.assert_has_calls([
-            call("eth0", 100),
-            call("wlan0", 600),
-            call("wwan0", 700)
-        ])
+    def test_optional_cellular_wins_when_wifi_unhealthy(self):
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 600, "wwan0": 700}
+        self.handler._ping_interface.side_effect = lambda iface: iface == "wwan0"
+        with patch.object(self.handler, "_nm_profile", return_value=(UUID, -1)):
+            self.handler._check_network()
+        self.assertEqual(self.handler.active_interface, "wwan0")
+        self.handler._helper.set_route_metric.assert_called_once_with("wwan0", UUID, 99)
 
+    def test_missing_profile_does_not_claim_failover(self):
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 600}
+        self.handler.active_interface = "eth0"
+        self.handler._ping_interface.side_effect = lambda iface: iface == "wlan0"
+        with patch.object(self.handler, "_nm_profile", return_value=None):
+            self.handler._check_network()
+        self.assertEqual(self.handler.active_interface, "eth0")
+        self.assertEqual(self.handler.failover_count, 0)
+        self.assertEqual(self.handler.interface_diagnostics["wlan0"]["action_error"], "metric_change_failed")
+        self.handler._helper.set_route_metric.assert_not_called()
 
-def subprocess_devnull():
-    import subprocess
-    return subprocess.DEVNULL
+    def test_failed_metric_action_does_not_claim_failover(self):
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 600}
+        self.handler.active_interface = "eth0"
+        self.handler._ping_interface.side_effect = lambda iface: iface == "wlan0"
+        self.handler._helper.set_route_metric.return_value = {"ok": False, "stderr": "rejected"}
+        with patch.object(self.handler, "_nm_profile", return_value=(UUID, -1)):
+            self.handler._check_network()
+        self.assertEqual(self.handler.active_interface, "eth0")
+        self.assertEqual(self.handler.failover_count, 0)
+
+    def test_diagnostic_mode_does_not_claim_route_change(self):
+        self.handler._default_routes.return_value = {"eth0": 100, "wlan0": 600}
+        self.handler.active_interface = "eth0"
+        self.handler._watchdog_mode = "diagnostic"
+        self.handler._ping_interface.side_effect = lambda iface: iface == "wlan0"
+        self.handler._check_network()
+        self.assertEqual(self.handler.active_interface, "eth0")
+        self.assertEqual(self.handler.failover_count, 0)
+
+    @patch("subprocess.run")
+    def test_multiple_health_targets(self, run):
+        run.side_effect = [MagicMock(returncode=1), MagicMock(returncode=0)]
+        self.assertTrue(NetworkWatchdogHandler._ping_interface(self.handler, "wlan0"))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.args[0][-1], "1.1.1.1")
+
+    @patch("subprocess.run")
+    def test_profile_resolution_uses_active_uuid(self, run):
+        run.side_effect = [MagicMock(returncode=0, stdout=UUID + "\n"), MagicMock(returncode=0, stdout="-1\n")]
+        self.assertEqual(self.handler._nm_profile("wlan0"), (UUID, -1))
+        self.assertEqual(run.call_args.args[0][-2:], ["uuid", UUID])
+
+    def test_notification_runs_outside_status_lock(self):
+        def publish():
+            self.assertTrue(self.handler._status_lock.acquire(blocking=False))
+            self.handler._status_lock.release()
+            self.handler.collect_watchdog_attributes()
+        self.gateway._attribute_sync._publish_attributes.side_effect = publish
+        self.handler._check_network()
+
+    def test_invalid_roles_and_targets_fail_config_validation(self):
+        from novena_gateway.gateway.novena_gateway import NovenaGateway
+
+        config = {
+            "gateway": {"serial_number": "NF-TEST"},
+            "mqtt": {"host": "localhost", "port": 1883},
+            "connectors": [],
+            "features": {"network_watchdog": {
+                "interface_roles": {"eth0": "field", "wlan0": "invalid"},
+                "health_targets": [],
+            }},
+        }
+        errors = NovenaGateway.validate_config(config)
+        self.assertTrue(any("interface_roles" in error for error in errors))
+        self.assertTrue(any("health_targets" in error for error in errors))
+
+    def test_helper_uses_active_uuid_without_reactivating_profile(self):
+        helper = Path(__file__).resolve().parents[1] / "install/novena-gateway-helper"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            calls = Path(temp_dir) / "calls"
+            nmcli = Path(temp_dir) / "nmcli"
+            nmcli.write_text(
+                "#!/bin/sh\n"
+                f"echo \"$*\" >> '{calls}'\n"
+                f"if [ \"$1\" = -g ]; then echo '{UUID}'; fi\n"
+            )
+            nmcli.chmod(0o755)
+            env = {**os.environ, "PATH": f"{temp_dir}:{os.environ['PATH']}"}
+            result = subprocess.run(
+                ["bash", str(helper), "set-route-metric", "wlan0", UUID, "99"],
+                capture_output=True, text=True, env=env, timeout=3,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), [
+                "-g GENERAL.CON-UUID device show wlan0",
+                "device modify wlan0 ipv4.route-metric 99",
+            ])
+            calls.write_text("")
+            rejected = subprocess.run(
+                ["bash", str(helper), "set-route-metric", "wlan0", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "99"],
+                capture_output=True, text=True, env=env, timeout=3,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(calls.read_text().splitlines(), ["-g GENERAL.CON-UUID device show wlan0"])
 
 
 if __name__ == "__main__":

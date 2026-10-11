@@ -28,12 +28,15 @@ case "$action" in
         ;;
     set-route-metric)
         iface="${2:?interface required}"
-        metric="${3:?metric required}"
+        profile_uuid="${3:?active profile UUID required}"
+        metric="${4:?metric required}"
         valid_iface "$iface"
-        valid_int "$metric"
-        nmcli connection modify "$iface" ipv4.route-metric "$metric"
-        nmcli connection up "$iface"
-        echo "route metric updated"
+        [[ "$profile_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]
+        [[ "$metric" =~ ^(-1|[0-9]+)$ ]]
+        [[ "$(nmcli -g GENERAL.CON-UUID device show "$iface")" == "$profile_uuid" ]]
+        # Change only the active device. Never reactivate it or persist a profile edit.
+        nmcli device modify "$iface" ipv4.route-metric "$metric"
+        echo "temporary route metric updated"
         ;;
     configure-can)
         iface="${2:-can0}"
