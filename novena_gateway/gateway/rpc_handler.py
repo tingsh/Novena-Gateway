@@ -956,6 +956,14 @@ class RpcHandler:
             rpc_params["type"] = params["type"]
 
         content = self._build_connector_rpc_content(device_name, "get", rpc_params)
+        if str(connector.get_type()).lower() == "modbus":
+            # The inherited Modbus reserved-get parser accepts its documented
+            # semicolon-delimited schema, not a dictionary of parameters.
+            data_type = rpc_params.get("type") or ("bits" if function_code in (1, 2) else "16uint")
+            content["data"]["params"] = (
+                f"type={data_type};functionCode={function_code};"
+                f"objectsCount={objects_count};address={address};"
+            )
 
         log.info("Reading from device '%s': FC=%d, addr=%d, count=%d",
                  device_name, function_code, address, rpc_params["objectsCount"])

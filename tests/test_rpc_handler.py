@@ -17,8 +17,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from novena_gateway.gateway.rpc_handler import RpcHandler
+from novena_gateway.connectors.modbus.entities.rpc_request import RPCRequest
 from novena_gateway.gateway.ota_security import canonical_manifest_bytes
+from novena_gateway.gateway.rpc_handler import RpcHandler
 
 
 class MockConnector:
@@ -331,7 +332,21 @@ class TestRpcHandler(unittest.TestCase):
 
         content = self.mock_gateway._mock_connector.last_rpc_content
         self.assertEqual(content["data"]["method"], "get")
-        self.assertEqual(content["data"]["params"]["functionCode"], 3)
+        parsed = RPCRequest(content)
+        self.assertEqual(parsed.params["functionCode"], 3)
+        self.assertEqual(parsed.params["address"], 3060)
+        self.assertEqual(parsed.params["objectsCount"], 2)
+
+    def test_modbus_coil_read_uses_bits_in_reserved_rpc_schema(self):
+        self.handler._cmd_read_device({
+            "device_name": "Power Meter 1",
+            "functionCode": 1,
+            "address": 10,
+        })
+        content = self.mock_gateway._mock_connector.last_rpc_content
+        parsed = RPCRequest(content)
+        self.assertEqual(parsed.params["type"], "bits")
+        self.assertEqual(parsed.params["functionCode"], 1)
 
     def test_write_device_invalid_function_code(self):
         """write_device should reject read function codes."""
