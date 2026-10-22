@@ -110,6 +110,25 @@ class ModbusUplinkDecoderTest(unittest.TestCase):
             "running",
         )
 
+    def test_oem_invalid_values_and_nonfinite_floats_are_omitted(self):
+        self.assertIsNone(self.decode([0xFFFF, 0xFFFF], "32uint", invalidValues=[0xFFFFFFFF], multiplier=0.01))
+        self.assertIsNone(self.decode([0x7FFF], "16int", invalidValues=[0x7FFF], multiplier=0.001))
+        self.assertIsNone(self.decode(list(struct.unpack(">HH", struct.pack(">f", float("nan")))), "32float"))
+        self.assertEqual(self.decode([0, 2300], "32uint", invalidValues=[0xFFFFFFFF], multiplier=0.1), 230.0)
+
+    def test_energy_catalog_decodes_representative_oem_formats(self):
+        cases = (
+            (">f", 12.5, "32float", 1000, 12500.0),  # Schneider total kW -> W
+            (">q", 123456, "64int", 1, 123456),  # iEM3255 import Wh
+            (">Q", 987654, "64uint", 0.01, 9876.54),  # ABB import kWh
+            (">i", -1234, "32int", 0.01, -12.34),  # ABB signed active W
+            (">I", 50000, "32uint", 0.001, 50.0),  # Socomec mHz -> Hz
+        )
+        for packing, raw, data_type, multiplier, expected in cases:
+            with self.subTest(data_type=data_type, raw=raw):
+                registers = struct.unpack(">" + "H" * (struct.calcsize(packing) // 2), struct.pack(packing, raw))
+                self.assertAlmostEqual(self.decode(registers, data_type, multiplier=multiplier), expected)
+
     def test_normal_register_decoding_emits_no_pymodbus_warning(self):
         capture = CaptureHandler()
         pymodbus_logger = logging.getLogger("pymodbus")

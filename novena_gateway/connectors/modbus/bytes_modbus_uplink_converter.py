@@ -12,6 +12,7 @@
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
+from math import isfinite
 from struct import pack, unpack
 from time import time
 from typing import List, Union
@@ -220,12 +221,20 @@ class BytesModbusUplinkConverter(ModbusConverter):
             decoded_data = self.decode_from_registers(encoded_data, config,
                                                       endian_order, word_endian_order)
 
+            if decoded_data is None or (
+                isinstance(decoded_data, (int, float))
+                and (decoded_data in config.get('invalidValues', []) or not isfinite(decoded_data))
+            ):
+                return None
+
             if config.get('divider'):
                 decoded_data = float(decoded_data) / float(config['divider'])
             elif config.get('multiplier'):
                 decoded_data = decoded_data * config['multiplier']
             if config.get('offset') is not None:
                 decoded_data = decoded_data + config['offset']
+            if isinstance(decoded_data, (int, float)) and not isfinite(decoded_data):
+                return None
 
         if self._is_enum_value(config):
             decoded_data = self._process_enum_value(config, decoded_data)
