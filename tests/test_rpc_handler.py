@@ -348,6 +348,22 @@ class TestRpcHandler(unittest.TestCase):
         self.assertEqual(parsed.params["type"], "bits")
         self.assertEqual(parsed.params["functionCode"], 1)
 
+    def test_modbus_customer_float_type_is_normalized_for_connector(self):
+        self.handler._cmd_read_device({
+            "device_name": "Power Meter 1", "functionCode": 3,
+            "address": 3000, "objectsCount": 2, "type": "float32",
+        })
+        parsed = RPCRequest(self.mock_gateway._mock_connector.last_rpc_content)
+        self.assertEqual(parsed.params["type"], "32float")
+        self.assertEqual(parsed.params["objectsCount"], 2)
+
+    def test_modbus_wide_type_rejects_short_read(self):
+        with self.assertRaisesRegex(ValueError, "requires at least 2 objects"):
+            self.handler._cmd_read_device({
+                "device_name": "Power Meter 1", "functionCode": 3,
+                "address": 3000, "objectsCount": 1, "type": "float32",
+            })
+
     def test_write_device_invalid_function_code(self):
         """write_device should reject read function codes."""
         with self.assertRaises(ValueError) as ctx:

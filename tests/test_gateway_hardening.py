@@ -20,6 +20,19 @@ from novena_gateway.storage.sqlite.database import Database
 
 class TestGatewayHardening(unittest.TestCase):
 
+    def test_connector_restart_drops_stale_device_references(self):
+        gateway = object.__new__(NovenaGateway)
+        old_connector = MagicMock()
+        old_connector.get_name.return_value = "Modbus TCP Connector"
+        gateway._connectors = [old_connector]
+        gateway._devices = {"Cold Room": {"connector": old_connector}}
+
+        gateway._stop_connectors()
+
+        old_connector.close.assert_called_once_with()
+        self.assertEqual(gateway._connectors, [])
+        self.assertEqual(gateway._devices, {})
+
     def _pilot_config(self, ca_path):
         return {
             "deployment": {"mode": "pilot"},
@@ -236,6 +249,21 @@ class TestGatewayHardening(unittest.TestCase):
             publisher._client.will_set.call_args.kwargs["topic"],
             "v1/gateway/NF-LWT/attributes",
         )
+
+    def test_offline_shutdown_signals_mqtt_disconnect_before_waiting_for_loop(self):
+        publisher = object.__new__(NovenaMqttPublisher)
+        publisher._client = MagicMock()
+        publisher._storage = MagicMock()
+        publisher._storage_stop_event = Event()
+        publisher._flush_queue = MagicMock()
+        publisher._client.loop_stop.side_effect = lambda: self.assertTrue(publisher._client.disconnect.called)
+
+        publisher.disconnect()
+
+        self.assertTrue(publisher._storage_stop_event.is_set())
+        publisher._storage.stop.assert_called_once()
+        publisher._client.disconnect.assert_called_once()
+        publisher._client.loop_stop.assert_called_once()
 
 
 if __name__ == "__main__":

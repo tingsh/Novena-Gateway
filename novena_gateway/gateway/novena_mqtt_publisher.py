@@ -222,8 +222,10 @@ class NovenaMqttPublisher:
         self._storage.stop()
         # Flush remaining messages
         self._flush_queue()
-        self._client.loop_stop()
+        # Signal the network loop to exit before joining it. A blackholed broker
+        # can otherwise make loop_stop wait for the full MQTT keepalive timeout.
         self._client.disconnect()
+        self._client.loop_stop()
         log.info("MQTT publisher stopped.")
 
     # ─── Subscription management ─────────────────────────────────────

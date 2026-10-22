@@ -547,6 +547,9 @@ class NovenaGateway:
             except Exception as e:
                 log.error("Error stopping connector %s: %s", connector.get_name(), e)
         self._connectors.clear()
+        # Closed connector instances must not remain in the device registry.
+        # A replacement Modbus connector will register each live device again.
+        self._devices.clear()
 
     # ─── Data processing loop ─────────────────────────────────────────
 

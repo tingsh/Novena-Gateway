@@ -80,6 +80,14 @@ SIGNED_DEPLOYMENT_DIAGNOSTICS = {
     "deployment_validate",
 }
 
+MODBUS_READ_TYPE_ALIASES = {
+    "float32": "32float", "float64": "64float",
+    "int16": "16int", "uint16": "16uint",
+    "int32": "32int", "uint32": "32uint",
+    "int64": "64int", "uint64": "64uint",
+    "bool": "bits",
+}
+
 
 class RpcHandler:
     """Handles inbound RPC commands from Novena Hub."""
@@ -959,7 +967,11 @@ class RpcHandler:
         if str(connector.get_type()).lower() == "modbus":
             # The inherited Modbus reserved-get parser accepts its documented
             # semicolon-delimited schema, not a dictionary of parameters.
-            data_type = rpc_params.get("type") or ("bits" if function_code in (1, 2) else "16uint")
+            requested_type = str(rpc_params.get("type") or ("bits" if function_code in (1, 2) else "16uint"))
+            data_type = MODBUS_READ_TYPE_ALIASES.get(requested_type.lower(), requested_type)
+            minimum_count = 4 if data_type.startswith("64") else 2 if data_type.startswith("32") else 1
+            if objects_count < minimum_count:
+                raise ValueError(f"Modbus type {requested_type} requires at least {minimum_count} objects")
             content["data"]["params"] = (
                 f"type={data_type};functionCode={function_code};"
                 f"objectsCount={objects_count};address={address};"
