@@ -18,7 +18,7 @@ from typing import List, Union
 
 from pymodbus.client.mixin import ModbusClientMixin
 from pymodbus.constants import Endian
-from pymodbus.utilities import pack_bitstring, unpack_bitstring
+from pymodbus.pdu.pdu import pack_bitstring, unpack_bitstring
 
 from novena_gateway.connectors.modbus.entities.bytes_uplink_converter_config import BytesUplinkConverterConfig
 from novena_gateway.connectors.modbus.modbus_converter import ModbusConverter

@@ -52,7 +52,7 @@ from novena_gateway.connectors.modbus.entities.bytes_downlink_converter_config i
     BytesDownlinkConverterConfig  # noqa: E402
 from novena_gateway.connectors.modbus.backward_compatibility_adapter import BackwardCompatibilityAdapter  # noqa
 
-from pymodbus.exceptions import ConnectionException  # noqa: E402
+from pymodbus.exceptions import ConnectionException, ModbusIOException  # noqa: E402
 from pymodbus.pdu import ModbusPDU  # noqa
 from pymodbus.pdu.bit_message import WriteMultipleCoilsResponse, WriteSingleCoilResponse  # noqa: E402
 from pymodbus.constants import Endian  # noqa: E402
@@ -284,6 +284,15 @@ class AsyncModbusConnector(Connector, Thread):
                 self.__log.error('Timeout error for device %s', slave)
                 self.__record_device_failure(slave, "timeout", poll_started)
                 await slave.disconnect()
+            except ModbusIOException as e:
+                self.__delete_device_from_platform(slave)
+                self.__record_device_failure(slave, e, poll_started)
+                # A TCP socket can remain "connected" after the cable is lost.
+                # Pymodbus otherwise waits for several failed requests before
+                # closing it, delaying recovery even after the field link returns.
+                if slave.type == 'tcp':
+                    await slave.disconnect()
+                self.__log.error('Failed to poll %s device: %s', slave, e)
             except Exception as e:
                 self.__delete_device_from_platform(slave)
                 self.__record_device_failure(slave, e, poll_started)

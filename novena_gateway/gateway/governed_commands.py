@@ -65,6 +65,12 @@ class DurableCommandJournal:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
+    def reset(self):
+        """Forget command IDs, sequences, and reconciliation from a former claim."""
+        with self._lock:
+            self._state = {"commands": {}, "sequences": {}, "events": [], "max_epoch": 0}
+            self._persist()
+
     def get(self, command_id):
         with self._lock:
             record = self._state["commands"].get(command_id)
@@ -145,6 +151,15 @@ class GovernedCommandGuard:
     @property
     def policy_loaded(self):
         return bool(self._policy)
+
+    def reset_for_new_claim(self):
+        """Discard the former site's authorized controls and command evidence."""
+        self._policy = None
+        self.journal.reset()
+        try:
+            os.remove(self._policy_path)
+        except FileNotFoundError:
+            pass
 
     @property
     def policy_revision(self):

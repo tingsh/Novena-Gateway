@@ -8,7 +8,7 @@ setup(
     description="Novena Gateway IoT Gateway — Industrial protocol gateway for Novena Hub",
     author="Novena",
     packages=find_packages(),
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     entry_points={
         "console_scripts": [
             "novena-gateway=novena_gateway.main:main",
@@ -28,7 +28,7 @@ setup(
         "cryptography",
         "PySocks",
         "paho-mqtt>=1.6.0",
-        "pymodbus==3.8.6",
+        "pymodbus==3.9.2",
         "pyserial",
         "pyserial-asyncio",
     ],

@@ -19,13 +19,10 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pymodbus.datastore import (
-    ModbusSlaveContext,
-    ModbusServerContext,
-    ModbusSequentialDataBlock,
-)
+from pymodbus.datastore import ModbusServerContext, ModbusSequentialDataBlock
 from pymodbus.server import StartTcpServer
 
+from novena_gateway.connectors.modbus.entities.slave_context import SlaveContext
 from novena_gateway.gateway.payload_formatter import PayloadFormatter
 from novena_gateway.gateway.discovery_service import DiscoveryService
 from novena_gateway.gateway.entities.converted_data import ConvertedData
@@ -77,7 +74,7 @@ class TestModbusIntegration(unittest.TestCase):
     def setUpClass(cls):
         """Start a local Modbus TCP server in a background thread."""
         hr_block = build_holding_registers(cls.REGISTER_MAP, total_count=100)
-        store = ModbusSlaveContext(hr=hr_block, ir=hr_block)
+        store = SlaveContext(hr=hr_block, ir=hr_block)
         cls.context = ModbusServerContext(slaves=store, single=True)
 
         cls._server_thread = threading.Thread(

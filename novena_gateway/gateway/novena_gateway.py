@@ -12,7 +12,7 @@ import os
 import signal
 import sys
 from queue import SimpleQueue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, time
 
 import sdnotify
@@ -57,6 +57,7 @@ class NovenaGateway:
         self._startup_status = "initializing"
         self._startup_error = None
         self._stopped = False
+        self._field_claim_lock = Lock()
         self.stop_event = Event()
 
         # MQTT publisher
@@ -65,7 +66,12 @@ class NovenaGateway:
             mqtt_config["bootstrap_mqtt"] = self._config["bootstrap_mqtt"]
         if "storage" in self._config:
             mqtt_config["storage"] = self._config["storage"]
+        mqtt_config["trusted_release_keys"] = (
+            self._config.get("features", {}).get("rpc", {}).get("trusted_command_keys", {})
+        )
         self._mqtt_publisher = NovenaMqttPublisher(mqtt_config, serial_number=self._serial_number, config_path=config_path)
+        self._mqtt_publisher.on_claim_changed = self._reset_field_state_for_new_claim
+        self._mqtt_publisher.on_release = self._reset_field_state_for_release
 
         # Payload formatter
         self._formatter = PayloadFormatter(self._serial_number)
@@ -132,6 +138,7 @@ class NovenaGateway:
             config=remote_config_cfg,
             clock_ready=self._clock_health.synchronized,
         )
+        self._mqtt_publisher.on_release_revoked = self._retire_release_credentials
 
         # RPC handler
         self._rpc_handler = RpcHandler(
@@ -450,6 +457,9 @@ class NovenaGateway:
 
     def _start_connectors(self):
         """Instantiate and start all connectors defined in config."""
+        if self._config.get("mqtt", {}).get("mode") == "release_pending":
+            log.warning("Gateway release is pending; field connectors remain disabled.")
+            return []
         connectors_config = self._config.get("connectors", [])
         results = []
 
@@ -551,6 +561,29 @@ class NovenaGateway:
         # A replacement Modbus connector will register each live device again.
         self._devices.clear()
 
+    def _reset_field_state_for_new_claim(self, config: dict):
+        """Retire the previous owner's live connector and queued samples."""
+        with self._field_claim_lock:
+            self._stop_connectors()
+            self._data_queue = SimpleQueue()
+            self._device_health.clear()
+            self._connector_start_results = []
+            self._config = config
+            self._remote_config.reset_for_new_claim(config)
+            self._rpc_handler._governance.reset_for_new_claim()
+        log.info("Cleared previous claim field configuration and live samples.")
+
+    def _reset_field_state_for_release(self, config: dict):
+        """Retire site-owned state before acknowledging a release to Hub."""
+        self._reset_field_state_for_new_claim(config)
+        self._mqtt_publisher.clear_claim_buffer()
+        log.info("Gateway site configuration and buffered events cleared for release.")
+
+    def _retire_release_credentials(self, config: dict):
+        """Keep the rollback copy free of revoked site credentials."""
+        self._remote_config.reset_for_new_claim(config)
+        self._config = config
+
     # ─── Data processing loop ─────────────────────────────────────────
 
     def _data_processing_loop(self):
@@ -565,11 +598,14 @@ class NovenaGateway:
                 continue
 
             try:
-                payloads = self._formatter.format(converted_data)
-                for payload in payloads:
-                    self._mqtt_publisher.publish(payload)
-                    log.debug("Published payload from %s: device=%s",
-                              connector_name, converted_data.device_name)
+                with self._field_claim_lock:
+                    if not self._connectors:
+                        continue
+                    payloads = self._formatter.format(converted_data)
+                    for payload in payloads:
+                        self._mqtt_publisher.publish(payload)
+                        log.debug("Published payload from %s: device=%s",
+                                  connector_name, converted_data.device_name)
             except Exception as e:
                 log.exception("Error processing data from %s: %s", connector_name, e)
 

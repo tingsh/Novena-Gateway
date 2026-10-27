@@ -6,19 +6,173 @@ import tempfile
 import unittest
 import datetime as real_datetime
 import json
+import base64
+import uuid
+from datetime import datetime, timedelta, timezone
 from queue import SimpleQueue
-from threading import Event
+from threading import Event, Lock
 from unittest.mock import MagicMock, patch
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from novena_gateway.gateway.novena_gateway import NovenaGateway
 from novena_gateway.gateway.novena_mqtt_publisher import NovenaMqttPublisher
+from novena_gateway.gateway.deployment_setup import canonical_bytes
+from novena_gateway.gateway.governed_commands import GovernedCommandGuard
 from novena_gateway.gateway.redaction import redact_secrets, redact_text
 from novena_gateway.storage.sqlite.database import Database
 
 
 class TestGatewayHardening(unittest.TestCase):
+
+    def test_release_removes_offline_sqlite_events(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "sqlite") + os.sep
+            with patch("novena_gateway.gateway.novena_mqtt_publisher.DATA_DIR", folder):
+                publisher = NovenaMqttPublisher(
+                    {"storage": {"data_file_path": path}}, serial_number="NF-RESET"
+                )
+                try:
+                    publisher._storage.put(json.dumps({"topic": "old", "payload": {"value": 10}}))
+                    publisher.clear_claim_buffer()
+                    self.assertEqual(publisher._storage.len(), 0)
+                    self.assertEqual(publisher._queue.qsize(), 0)
+                finally:
+                    publisher._storage.stop()
+
+    def test_new_claim_clears_governed_control_policy_and_journal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            policy_path = os.path.join(folder, "policy.json")
+            journal_path = os.path.join(folder, "journal.json")
+            guard = GovernedCommandGuard(
+                serial_number="NF-RESET", gateway=MagicMock(),
+                config={"command_policy_path": policy_path, "command_journal_path": journal_path},
+            )
+            guard.journal.write("old-command", {"device_id": "old-device", "sequence_number": 3})
+            with open(policy_path, "w", encoding="utf-8") as handle:
+                json.dump({"old": "site policy"}, handle)
+            guard._policy = {"old": "site policy"}
+
+            guard.reset_for_new_claim()
+
+            self.assertFalse(guard.policy_loaded)
+            self.assertFalse(os.path.exists(policy_path))
+            self.assertIsNone(guard.journal.get("old-command"))
+            self.assertEqual(guard.journal.max_sequence("old-device"), 0)
+
+    def test_signed_release_resets_before_ack_and_replay_is_idempotent(self):
+        key = Ed25519PrivateKey.generate()
+        public_key = key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            config_path = os.path.join(folder, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({"gateway": {"serial_number": "NF-RESET"}, "mqtt": {"claim_id": "old-claim"},
+                           "connectors": [{"type": "modbus", "name": "Old site"}]}, handle)
+            publisher = object.__new__(NovenaMqttPublisher)
+            publisher._serial_number = "NF-RESET"
+            publisher._config_path = config_path
+            publisher._claim_id = "old-claim"
+            publisher._trusted_release_keys = {"key-1": base64.b64encode(public_key).decode()}
+            publisher._release_request_id = None
+            publisher._release_in_progress = False
+            publisher._qos = 1
+            publisher._client = MagicMock()
+            publisher._client.publish.return_value.rc = 0
+            publisher.on_release = MagicMock()
+            body = {
+                "schema_version": 1, "action": "release", "request_id": str(uuid.uuid4()),
+                "claim_id": "old-claim", "target": {"gateway_serial": "NF-RESET"},
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            }
+            wire = {**body, "signing_key_id": "key-1", "signature": base64.b64encode(
+                key.sign(canonical_bytes(body))).decode()}
+
+            publisher._on_provision_message("v1/gateway/NF-RESET/provision", wire)
+            publisher._on_provision_message("v1/gateway/NF-RESET/provision", wire)
+
+            with open(config_path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertEqual(saved["connectors"], [])
+            self.assertEqual(saved["mqtt"]["mode"], "release_pending")
+            self.assertEqual(saved["mqtt"]["release_request_id"], body["request_id"])
+            publisher.on_release.assert_called_once()
+            self.assertEqual(publisher._client.publish.call_count, 2)
+            publisher._client.publish.return_value.wait_for_publish.assert_not_called()
+
+    def test_release_rejects_wrong_claim_and_tampering(self):
+        key = Ed25519PrivateKey.generate()
+        public_key = key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
+        )
+        publisher = object.__new__(NovenaMqttPublisher)
+        publisher._serial_number = "NF-RESET"
+        publisher._claim_id = "current-claim"
+        publisher._trusted_release_keys = {"key-1": base64.b64encode(public_key).decode()}
+        publisher.on_release = MagicMock()
+        publisher._client = MagicMock()
+        body = {"schema_version": 1, "action": "release", "request_id": str(uuid.uuid4()),
+                "claim_id": "old-claim", "target": {"gateway_serial": "NF-RESET"},
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
+        wire = {**body, "signing_key_id": "key-1", "signature": base64.b64encode(key.sign(canonical_bytes(body))).decode()}
+
+        publisher._on_provision_message("v1/gateway/NF-RESET/provision", wire)
+        publisher._on_provision_message("v1/gateway/NF-RESET/provision", {**wire, "claim_id": "current-claim"})
+
+        publisher.on_release.assert_not_called()
+        publisher._client.publish.assert_not_called()
+
+    def test_broker_revocation_erases_old_operational_credentials_before_reclaim(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config_path = os.path.join(folder, "config.json")
+            release_id = str(uuid.uuid4())
+            config = {
+                "gateway": {"serial_number": "NF-RESET"},
+                "mqtt": {"username": "NF-RESET", "password": "old-site-secret", "mode": "release_pending",
+                         "claim_id": "old-claim", "release_request_id": release_id},
+                "bootstrap_mqtt": {"enabled": True, "username": "bootstrap:NF-RESET", "password": "factory-code"},
+                "connectors": [],
+            }
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle)
+            with patch("novena_gateway.gateway.novena_mqtt_publisher.DATA_DIR", folder):
+                publisher = NovenaMqttPublisher(
+                    {**config["mqtt"], "bootstrap_mqtt": config["bootstrap_mqtt"],
+                     "storage": {"data_file_path": os.path.join(folder, "sqlite") + os.sep}},
+                    serial_number="NF-RESET", config_path=config_path,
+                )
+                publisher.on_release_revoked = MagicMock()
+                publisher._reconnect_with_current_credentials = MagicMock()
+                try:
+                    publisher._on_connect(None, None, None, "Not authorized")
+                    with open(config_path, encoding="utf-8") as handle:
+                        saved = json.load(handle)
+                    self.assertEqual(saved["mqtt"]["username"], "")
+                    self.assertEqual(saved["mqtt"]["password"], "")
+                    self.assertNotIn("claim_id", saved["mqtt"])
+                    self.assertEqual(saved["mqtt"]["release_request_id"], release_id)
+                    self.assertEqual(saved["bootstrap_mqtt"], config["bootstrap_mqtt"])
+                    self.assertEqual(saved["connectors"], [])
+                    publisher.on_release_revoked.assert_called_once_with(saved)
+                    self.assertTrue(publisher._bootstrap_mode)
+                    self.assertEqual(publisher._username, "bootstrap:NF-RESET")
+                    self.assertEqual(publisher._password, "factory-code")
+                    publisher._reconnect_with_current_credentials.assert_called_once()
+
+                    restarted = NovenaMqttPublisher(
+                        {**saved["mqtt"], "bootstrap_mqtt": saved["bootstrap_mqtt"],
+                         "storage": {"data_file_path": os.path.join(folder, "sqlite") + os.sep}},
+                        serial_number="NF-RESET", config_path=config_path,
+                    )
+                    self.assertTrue(restarted._bootstrap_mode)
+                    self.assertEqual(restarted._username, "bootstrap:NF-RESET")
+                    restarted._storage.stop()
+                finally:
+                    publisher._storage.stop()
 
     def test_connector_restart_drops_stale_device_references(self):
         gateway = object.__new__(NovenaGateway)
@@ -136,7 +290,7 @@ class TestGatewayHardening(unittest.TestCase):
                 {
                     "gateway": {"serial_number": "NF-ACT"},
                     "mqtt": {"username": "bootstrap:NF-ACT", "password": "claim"},
-                    "connectors": [],
+                    "connectors": [{"type": "modbus", "name": "Previous customer's meter"}],
                 },
                 config_file,
             )
@@ -149,6 +303,8 @@ class TestGatewayHardening(unittest.TestCase):
             publisher._username = "bootstrap:NF-ACT"
             publisher._password = "claim"
             publisher._bootstrap_mode = True
+            publisher._claim_id = "previous-claim"
+            publisher.on_claim_changed = MagicMock()
             publisher.publish_attributes = MagicMock(return_value=True)
             publisher._reconnect_with_current_credentials = MagicMock()
 
@@ -157,6 +313,7 @@ class TestGatewayHardening(unittest.TestCase):
                 {
                     "request_id": "activation-request",
                     "action": "activate",
+                    "claim_id": "factory-claim",
                     "mqtt": {"username": "NF-ACT", "password": "operational-secret"},
                 },
             )
@@ -166,6 +323,10 @@ class TestGatewayHardening(unittest.TestCase):
             self.assertEqual(config["mqtt"]["username"], "NF-ACT")
             self.assertEqual(config["mqtt"]["password"], "operational-secret")
             self.assertEqual(config["mqtt"]["mode"], "operational")
+            self.assertEqual(config["mqtt"]["claim_id"], "factory-claim")
+            self.assertEqual(publisher._claim_id, "factory-claim")
+            self.assertEqual(config["connectors"], [])
+            publisher.on_claim_changed.assert_called_once_with(config)
             self.assertFalse(publisher._bootstrap_mode)
             publisher.publish_attributes.assert_called_once()
             ack, kwargs = publisher.publish_attributes.call_args
@@ -176,6 +337,74 @@ class TestGatewayHardening(unittest.TestCase):
             publisher._reconnect_with_current_credentials.assert_called_once()
         finally:
             os.unlink(config_path)
+
+    def test_replay_discards_previous_claim_events_without_publishing(self):
+        publisher = object.__new__(NovenaMqttPublisher)
+        publisher._claim_id = "factory-claim"
+        publisher._stopped = False
+        publisher._connected = True
+        publisher._bootstrap_mode = False
+        publisher._storage = MagicMock()
+        publisher._storage.len.side_effect = [1, 0]
+        publisher._storage.get_event_pack.return_value = [json.dumps({
+            "topic": "v1/gateway/NF-ACT/logs",
+            "payload": {"logs": [{"message": "old customer"}]},
+            "claim_id": "cold-room-claim",
+        })]
+        publisher._client = MagicMock()
+        publisher._qos = 1
+        with patch("novena_gateway.gateway.novena_mqtt_publisher.sleep"):
+            publisher._replay_loop()
+
+        publisher._client.publish.assert_not_called()
+        publisher._storage.event_pack_processing_done.assert_called_once_with()
+
+    def test_bootstrap_connection_does_not_replay_offline_buffer(self):
+        publisher = object.__new__(NovenaMqttPublisher)
+        publisher._host = "broker"
+        publisher._port = 1883
+        publisher._bootstrap_mode = True
+        publisher._last_error = None
+        publisher._resubscribe_all = MagicMock()
+        publisher._publish_bootstrap_hello = MagicMock()
+        publisher._trigger_replay = MagicMock()
+        publisher._on_connect(None, None, None, 0)
+        publisher._publish_bootstrap_hello.assert_called_once_with()
+        publisher._trigger_replay.assert_not_called()
+
+    def test_bootstrap_hello_does_not_wait_inside_mqtt_callback(self):
+        publisher = object.__new__(NovenaMqttPublisher)
+        publisher._serial_number = "NF-ACT"
+        publisher._qos = 1
+        publisher._client = MagicMock()
+        publisher._client.publish.return_value.rc = 0
+
+        publisher._publish_bootstrap_hello()
+
+        publisher._client.publish.assert_called_once()
+        publisher._client.publish.return_value.wait_for_publish.assert_not_called()
+
+    def test_new_claim_stops_old_connector_and_clears_pending_samples(self):
+        gateway = object.__new__(NovenaGateway)
+        gateway._field_claim_lock = Lock()
+        gateway._connectors = [MagicMock()]
+        gateway._devices = {"Previous device": {}}
+        gateway._device_health = {"Previous device": {}}
+        gateway._data_queue = SimpleQueue()
+        gateway._data_queue.put(("old", object()))
+        gateway._remote_config = MagicMock()
+        gateway._rpc_handler = MagicMock()
+        config = {"connectors": []}
+
+        gateway._reset_field_state_for_new_claim(config)
+
+        self.assertEqual(gateway._connectors, [])
+        self.assertEqual(gateway._devices, {})
+        self.assertEqual(gateway._device_health, {})
+        self.assertTrue(gateway._data_queue.empty())
+        self.assertIs(gateway._config, config)
+        gateway._remote_config.reset_for_new_claim.assert_called_once_with(config)
+        gateway._rpc_handler._governance.reset_for_new_claim.assert_called_once_with()
 
     def test_activation_payload_missing_password_reports_failed_ack(self):
         publisher = object.__new__(NovenaMqttPublisher)

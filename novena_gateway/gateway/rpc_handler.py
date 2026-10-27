@@ -170,6 +170,9 @@ class RpcHandler:
         pass
 
     def _on_control_policy(self, topic, payload):
+        if self._gateway._config.get("mqtt", {}).get("mode") == "release_pending":
+            log.warning("Ignored control policy while Gateway release is pending.")
+            return
         try:
             self._governance.install_policy(topic, payload)
             log.info(
@@ -194,6 +197,9 @@ class RpcHandler:
 
     def _on_rpc_request(self, topic: str, payload: dict):
         """Handle an inbound RPC request."""
+        if self._gateway._config.get("mqtt", {}).get("mode") == "release_pending":
+            log.warning("Ignored RPC while Gateway release is pending.")
+            return
         if not isinstance(payload, dict):
             log.warning("Rejected malformed RPC payload: expected an object")
             return

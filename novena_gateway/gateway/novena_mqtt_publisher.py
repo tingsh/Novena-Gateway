@@ -13,16 +13,25 @@ Features:
 - Optional TLS support
 """
 
+import base64
+import binascii
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
+from datetime import datetime, timezone
 from queue import Queue, Full, Empty
 from time import sleep, time
 from typing import Callable, Dict, List, Optional
+from uuid import UUID
 
 import paho.mqtt.client as mqtt
-from novena_gateway.gateway.runtime_paths import SQLITE_DATA_FILE_PATH
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from novena_gateway.gateway.deployment_setup import canonical_bytes
+from novena_gateway.gateway.runtime_paths import DATA_DIR, SQLITE_DATA_FILE_PATH
 from novena_gateway.storage.sqlite.sqlite_event_storage import SQLiteEventStorage
 
 log = logging.getLogger("novena_gateway.mqtt_publisher")
@@ -45,6 +54,17 @@ class NovenaMqttPublisher:
         self._reconnect_delay_max = config.get("reconnect_delay_max", 60)
         self._serial_number = serial_number
         self._config_path = config_path
+        # Stable for one Hub claim, including activation retries and password rotations.
+        self._claim_id = config.get("claim_id")
+        self.on_claim_changed = None
+        self.on_release = None
+        self.on_release_revoked = None
+        self._trusted_release_keys = config.get("trusted_release_keys") or {}
+        self._release_request_id = config.get("release_request_id")
+        self._release_in_progress = config.get("mode") == "release_pending"
+        self._operational_credentials_retired = bool(
+            self._release_in_progress and self._release_request_id and not self._username and not self._password
+        )
         self._telemetry_topic = self._scoped_topic(
             "telemetry",
             legacy_fallback=config.get("topic", "v1/gateway/telemetry"),
@@ -78,8 +98,10 @@ class NovenaMqttPublisher:
             "writing_batch_size": 50,
         }
         storage_config.update(sqlite_config or {})
+        self._resolved_storage_config = storage_config
         self._storage_stop_event = threading.Event()
         self._storage = SQLiteEventStorage(storage_config, log, self._storage_stop_event)
+        self._buffer_lock = threading.Lock()
         self._replay_thread = None
         self._replay_lock = threading.Lock()
         self._last_replay_status = "idle"
@@ -94,6 +116,12 @@ class NovenaMqttPublisher:
 
         if self._username:
             self._client.username_pw_set(self._username, self._password)
+        elif self._operational_credentials_retired and self._bootstrap.get("enabled"):
+            self._username = self._bootstrap.get("username", "")
+            self._password = self._bootstrap.get("password", "")
+            if self._username and self._password:
+                self._bootstrap_mode = True
+                self._client.username_pw_set(self._username, self._password)
 
         # ─── TLS configuration ───────────────────────────────────────
         self._configure_tls()
@@ -260,8 +288,11 @@ class NovenaMqttPublisher:
         Queue a payload dict for publishing.
         If topic is None, publishes to the default telemetry topic.
         """
+        if getattr(self, "_release_in_progress", False):
+            return
         topic = topic or self._telemetry_topic
-        item = (topic, payload)
+        payload = self._with_claim_id(payload, topic)
+        item = (topic, payload, self._claim_id)
         
         if self._connected:
             try:
@@ -277,21 +308,32 @@ class NovenaMqttPublisher:
                 self._queue.put_nowait(item)
         else:
             log.debug("Edge Gateway is offline. Buffering telemetry payload to SQLite database.")
-            event_str = json.dumps({"topic": topic, "payload": payload})
-            if not self._storage.put(event_str):
+            event_str = json.dumps({"topic": topic, "payload": payload, "claim_id": self._claim_id})
+            if not self._buffer_event(event_str):
                 self._dropped_message_count += 1
+
+    def _buffer_event(self, event_str: str) -> bool:
+        with self._buffer_lock:
+            if self._release_in_progress:
+                return True
+            return self._storage.put(event_str)
 
     def publish_now(self, payload: dict, topic: str) -> bool:
         """Publish immediately and wait for the MQTT client to accept the message."""
         if not self._connected:
             return False
-        result = self._client.publish(topic, json.dumps(payload), qos=self._qos)
+        result = self._client.publish(topic, json.dumps(self._with_claim_id(payload, topic)), qos=self._qos)
         try:
             result.wait_for_publish(timeout=5)
         except Exception as e:
             log.warning("Timed out waiting for publish on %s: %s", topic, e)
             return False
         return result.rc == mqtt.MQTT_ERR_SUCCESS
+
+    def _with_claim_id(self, payload: dict, topic: str) -> dict:
+        if self._claim_id and topic.endswith(("/telemetry", "/logs")):
+            return {**payload, "claim_id": self._claim_id}
+        return payload
 
     def publish_telemetry(self, payload: dict):
         """Publish to the telemetry topic."""
@@ -338,11 +380,14 @@ class NovenaMqttPublisher:
             if self._bootstrap_mode:
                 self._publish_bootstrap_hello()
             # Trigger throttled replay of offline buffer
-            self._trigger_replay()
+            if not self._bootstrap_mode:
+                self._trigger_replay()
         else:
             log.error("MQTT connection failed with code %s", rc)
             self._connected = False
             self._last_error = f"connect_failed_rc_{rc}"
+            if str(rc).lower() == "not authorized":
+                self._retire_revoked_operational_credentials()
             self._consecutive_failures += 1
             self._show_activation_message_if_needed()
             self._switch_to_bootstrap_if_needed()
@@ -385,6 +430,10 @@ class NovenaMqttPublisher:
         """Fall back to bootstrap credentials after repeated auth/connect failures."""
         if self._bootstrap_mode or self._consecutive_failures < 3:
             return
+        if self._release_in_progress and self._release_request_id and not self._operational_credentials_retired:
+            # Until broker revocation is observed, keep the operational session
+            # available for Hub retries of a reset acknowledgement.
+            return
         if not self._bootstrap.get("enabled", False):
             return
         username = self._bootstrap.get("username")
@@ -400,6 +449,47 @@ class NovenaMqttPublisher:
         log.warning("Switching MQTT client to bootstrap mode for self-serve activation.")
         self._reconnect_with_current_credentials()
 
+    def _retire_revoked_operational_credentials(self):
+        """Erase the old claim's local MQTT password only after broker denial."""
+        if (
+            not self._release_in_progress
+            or not self._release_request_id
+            or self._operational_credentials_retired
+            or self._bootstrap_mode
+            or not self._config_path
+            or not self.on_release_revoked
+        ):
+            return
+        try:
+            with open(self._config_path, encoding="utf-8") as handle:
+                config = json.load(handle)
+            mqtt_config = config.get("mqtt", {})
+            if mqtt_config.get("mode") != "release_pending" or mqtt_config.get("release_request_id") != self._release_request_id:
+                return
+            mqtt_config["username"] = ""
+            mqtt_config["password"] = ""
+            mqtt_config.pop("claim_id", None)
+            self.on_release_revoked(config)
+            directory = os.path.dirname(os.path.abspath(self._config_path))
+            fd, temporary = tempfile.mkstemp(prefix=".release-credentials-", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(config, handle, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self._config_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            self._username = ""
+            self._password = ""
+            self._claim_id = None
+            self._operational_credentials_retired = True
+            self._consecutive_failures = 2
+            log.info("Revoked operational MQTT credentials erased from Gateway configuration.")
+        except Exception as exc:
+            log.error("Could not erase revoked operational MQTT credentials: %s", exc)
+
     def _publish_bootstrap_hello(self):
         payload = {
             "serial_number": self._serial_number,
@@ -407,7 +497,11 @@ class NovenaMqttPublisher:
             "bootstrap": True,
         }
         topic = f"v1/gateway/{self._serial_number}/bootstrap/hello"
-        self.publish(payload, topic)
+        # Called from paho's on_connect callback: waiting for publish here
+        # blocks the network loop, including SUBACK and activation delivery.
+        result = self._client.publish(topic, json.dumps(payload), qos=self._qos)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            log.warning("Could not publish bootstrap hello (rc=%s).", result.rc)
 
     def _on_publish(self, client, userdata, mid, rc=None, properties=None):
         log.debug("Message %d published successfully.", mid)
@@ -445,28 +539,39 @@ class NovenaMqttPublisher:
                 continue
 
             # Items are now (topic, payload) tuples
-            if isinstance(item, tuple) and len(item) == 2:
+            if isinstance(item, tuple) and len(item) == 3:
+                topic, payload, claim_id = item
+            elif isinstance(item, tuple) and len(item) == 2:
                 topic, payload = item
+                claim_id = None
             else:
                 # Backward compatibility: bare dict goes to telemetry topic
                 topic = self._telemetry_topic
                 payload = item
 
+                claim_id = None
+
+            if claim_id != self._claim_id:
+                log.warning("Discarded queued MQTT event from a previous Gateway claim.")
+                continue
+            if getattr(self, "_release_in_progress", False):
+                continue
+
             json_payload = json.dumps(payload)
 
-            if self._connected:
+            if self._connected and not self._bootstrap_mode:
                 result = self._client.publish(
                     topic, json_payload, qos=self._qos
                 )
                 if result.rc != mqtt.MQTT_ERR_SUCCESS:
                     log.warning("Publish failed (rc=%d) on %s, buffering to SQLite.", result.rc, topic)
-                    event_str = json.dumps({"topic": topic, "payload": payload})
-                    if not self._storage.put(event_str):
+                    event_str = json.dumps({"topic": topic, "payload": payload, "claim_id": claim_id})
+                    if not self._buffer_event(event_str):
                         self._dropped_message_count += 1
             else:
                 log.debug("Not connected in publish loop — buffering message to SQLite.")
-                event_str = json.dumps({"topic": topic, "payload": payload})
-                if not self._storage.put(event_str):
+                event_str = json.dumps({"topic": topic, "payload": payload, "claim_id": claim_id})
+                if not self._buffer_event(event_str):
                     self._dropped_message_count += 1
                 sleep(1)
 
@@ -482,7 +587,7 @@ class NovenaMqttPublisher:
     def _replay_loop(self):
         """Replay buffered historical messages from SQLite at a throttled pace."""
         log.info("Replay loop started. Checking SQLite database buffer for offline events...")
-        while not self._stopped and self._connected:
+        while not self._stopped and self._connected and not self._bootstrap_mode and not getattr(self, "_release_in_progress", False):
             storage_len = self._storage.len()
             if storage_len == 0:
                 self._last_replay_status = "complete"
@@ -498,12 +603,19 @@ class NovenaMqttPublisher:
             
             success_count = 0
             for event_str in pack:
-                if self._stopped or not self._connected:
+                if self._stopped or not self._connected or getattr(self, "_release_in_progress", False):
                     break
                 try:
                     event = json.loads(event_str)
                     topic = event["topic"]
                     payload = event["payload"]
+
+                    if event.get("claim_id") != self._claim_id:
+                        log.warning("Discarded buffered MQTT event from a previous Gateway claim.")
+                        success_count += 1
+                        continue
+                    if self._bootstrap_mode:
+                        break
                     
                     result = self._client.publish(topic, json.dumps(payload), qos=self._qos)
                     sleep(0.1)  # 100ms throttle between messages
@@ -531,10 +643,14 @@ class NovenaMqttPublisher:
     def _flush_queue(self):
         """Attempt to publish remaining messages before shutdown."""
         flush_count = 0
-        while not self._queue.empty() and self._connected:
+        while not self._queue.empty() and self._connected and not self._bootstrap_mode:
             try:
                 item = self._queue.get_nowait()
-                if isinstance(item, tuple) and len(item) == 2:
+                if isinstance(item, tuple) and len(item) == 3:
+                    topic, payload, claim_id = item
+                    if claim_id != self._claim_id:
+                        continue
+                elif isinstance(item, tuple) and len(item) == 2:
                     topic, payload = item
                 else:
                     topic = self._telemetry_topic
@@ -565,7 +681,9 @@ class NovenaMqttPublisher:
     def _on_provision_message(self, topic: str, payload: dict):
         """Handle inbound provisioning commands (e.g. password rotation)."""
         action = payload.get("action")
-        if action in ("rotate_password", "activate"):
+        if action == "release":
+            self._handle_release(payload)
+        elif action in ("rotate_password", "activate"):
             mqtt_cfg = payload.get("mqtt") or {}
             new_password = payload.get("new_password") or mqtt_cfg.get("password")
             new_username = mqtt_cfg.get("username") or self._serial_number
@@ -586,9 +704,106 @@ class NovenaMqttPublisher:
                 request_id=request_id,
                 action=action,
                 generation=payload.get("generation"),
+                claim_id=payload.get("claim_id"),
             )
         else:
             log.warning("Unknown provision action: %s", action)
+
+    def _verify_release(self, payload: dict) -> str:
+        """Require the Hub's signing key, current claim, target, and fresh expiry."""
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("invalid release schema")
+        if payload.get("action") != "release" or (payload.get("target") or {}).get("gateway_serial") != self._serial_number:
+            raise ValueError("release targets a different Gateway")
+        request_id = str(UUID(str(payload.get("request_id"))))
+        if payload.get("claim_id") != self._claim_id or not self._claim_id:
+            raise ValueError("release belongs to a different claim")
+        key_id = payload.get("signing_key_id")
+        encoded_key = self._trusted_release_keys.get(key_id)
+        if not encoded_key:
+            raise ValueError("untrusted release signing key")
+        expiry = datetime.fromisoformat(str(payload.get("expires_at")).replace("Z", "+00:00"))
+        if expiry.tzinfo is None or expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            raise ValueError("expired release request")
+        body = {k: v for k, v in payload.items() if k not in {"signing_key_id", "signature"}}
+        key = Ed25519PublicKey.from_public_bytes(base64.b64decode(encoded_key, validate=True))
+        key.verify(base64.b64decode(payload.get("signature") or "", validate=True), canonical_bytes(body))
+        return request_id
+
+    def _handle_release(self, payload: dict):
+        try:
+            request_id = self._verify_release(payload)
+            if self._release_request_id != request_id:
+                if not self.on_release or not self._config_path:
+                    raise RuntimeError("Gateway release reset is unavailable")
+                with open(self._config_path, encoding="utf-8") as handle:
+                    config = json.load(handle)
+                config["connectors"] = []
+                config["mqtt"]["mode"] = "release_pending"
+                directory = os.path.dirname(os.path.abspath(self._config_path))
+                fd, temporary = tempfile.mkstemp(prefix=".release-config-", dir=directory)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(config, handle, indent=2)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, self._config_path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                self._release_in_progress = True
+                self.on_release(config)
+                config["mqtt"]["release_request_id"] = request_id
+                fd, temporary = tempfile.mkstemp(prefix=".release-config-", dir=directory)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(config, handle, indent=2)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, self._config_path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                self._release_request_id = request_id
+            self._publish_release_ack(request_id)
+        except (ValueError, TypeError, KeyError, InvalidSignature, OSError, RuntimeError, binascii.Error) as exc:
+            log.warning("Rejected or could not complete Gateway release: %s", exc)
+
+    def clear_claim_buffer(self):
+        """Erase offline data and pending sends after all site connectors have stopped."""
+        self._release_in_progress = True
+        self._queue = Queue(maxsize=self._max_queue_size)
+        if self._replay_thread and self._replay_thread.is_alive():
+            self._replay_thread.join(timeout=5)
+            if self._replay_thread.is_alive():
+                raise RuntimeError("offline replay did not stop")
+        with self._buffer_lock:
+            storage_dir = os.path.realpath(self._resolved_storage_config["data_file_path"])
+            data_root = os.path.realpath(DATA_DIR)
+            if not storage_dir.startswith(data_root + os.sep):
+                raise RuntimeError("unsafe SQLite storage directory")
+            self._storage.stop()
+            if os.path.isdir(storage_dir):
+                shutil.rmtree(storage_dir)
+            os.makedirs(storage_dir, mode=0o700, exist_ok=True)
+            self._storage = SQLiteEventStorage(self._resolved_storage_config, log, self._storage_stop_event)
+
+    def _publish_release_ack(self, request_id: str):
+        ack = {
+            "serial_number": self._serial_number,
+            "ts": int(time() * 1000),
+            "attributes": {
+                "gateway_release_status": "reset_complete",
+                "gateway_release_request_id": request_id,
+                "gateway_release_claim_id": self._claim_id,
+            },
+        }
+        # This runs on paho's network thread. Waiting for PUBACK here would
+        # deadlock the loop; Hub retries if the QoS-1 receipt is lost.
+        topic = self._scoped_topic("attributes")
+        result = self._client.publish(topic, json.dumps(ack), qos=1)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            log.warning("Gateway release acknowledgement could not be queued (rc=%s).", result.rc)
 
     def _rotate_password(
         self,
@@ -597,6 +812,7 @@ class NovenaMqttPublisher:
         request_id: str = None,
         action: str = "rotate_password",
         generation=None,
+        claim_id=None,
     ):
         """
         Rotate MQTT credentials:
@@ -605,6 +821,7 @@ class NovenaMqttPublisher:
         3. Disconnect and reconnect with new credentials
         """
         log.info("MQTT password rotation initiated...")
+        claim_changed = action == "activate" and bool(claim_id) and claim_id != self._claim_id
 
         # 1. Update config.json on disk
         if self._config_path:
@@ -615,6 +832,11 @@ class NovenaMqttPublisher:
                     config["mqtt"]["username"] = new_username
                 config["mqtt"]["password"] = new_password
                 config["mqtt"]["mode"] = "operational"
+                if action == "activate" and claim_id:
+                    config["mqtt"]["claim_id"] = claim_id
+                    config["mqtt"].pop("release_request_id", None)
+                if claim_changed:
+                    config["connectors"] = []
                 tmp_path = self._config_path + ".tmp"
                 with open(tmp_path, 'w') as f:
                     json.dump(config, f, indent=2)
@@ -625,10 +847,23 @@ class NovenaMqttPublisher:
                 self._publish_credential_ack(action, request_id, "failed", str(e), generation=generation)
                 return
 
+        if claim_changed and self.on_claim_changed:
+            try:
+                self.on_claim_changed(config)
+            except Exception as e:
+                log.exception("Failed to clear previous claim field state: %s", e)
+                self._publish_credential_ack(action, request_id, "failed", "field state reset failed", generation=generation)
+                return
+
         # 2. Update in-memory password
         if new_username:
             self._username = new_username
         self._password = new_password
+        if action == "activate" and claim_id:
+            self._claim_id = claim_id
+            self._release_request_id = None
+            self._release_in_progress = False
+            self._operational_credentials_retired = False
         self._bootstrap_mode = False
         if hasattr(self, "_client"):
             self._client.username_pw_set(self._username, self._password)

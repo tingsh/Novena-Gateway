@@ -2,7 +2,9 @@
 
 import asyncio
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+from pymodbus.exceptions import ModbusIOException
 
 from novena_gateway.connectors.modbus.modbus_connector import AsyncModbusConnector
 
@@ -39,6 +41,27 @@ class TestModbusPollOverlap(unittest.IsolatedAsyncioTestCase):
             connector._AsyncModbusConnector__stopped = True
             processor.cancel()
             await asyncio.gather(processor, return_exceptions=True)
+
+    async def test_tcp_no_response_closes_stale_client_for_next_poll(self):
+        connector = object.__new__(AsyncModbusConnector)
+        connector._AsyncModbusConnector__log = MagicMock()
+        connector._AsyncModbusConnector__gateway = MagicMock()
+        connector._AsyncModbusConnector__gateway.get_devices.return_value = {"Main Gateway"}
+        connector._AsyncModbusConnector__read_slave_data = AsyncMock(
+            side_effect=ModbusIOException("No response received after 3 retries")
+        )
+        slave = MagicMock(type="tcp", device_name="Main Gateway")
+        slave.uplink_converter_config.attributes = []
+        slave.uplink_converter_config.telemetry = [{"tag": "temperature"}]
+        slave.connect = AsyncMock(return_value=True)
+        slave.disconnect = AsyncMock()
+        slave.master.connected.return_value = True
+
+        await connector._AsyncModbusConnector__poll_device(slave)
+
+        slave.disconnect.assert_awaited_once()
+        connector._AsyncModbusConnector__gateway.del_device.assert_called_once_with("Main Gateway")
+        connector._AsyncModbusConnector__gateway.record_device_failure.assert_called_once()
 
     async def test_two_slaves_on_one_master_do_not_poll_concurrently(self):
         connector = object.__new__(AsyncModbusConnector)

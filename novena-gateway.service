@@ -17,6 +17,7 @@ SyslogIdentifier=novena-gateway
 # Environment
 Environment=PYTHONUNBUFFERED=1
 Environment=TB_GW_LOGS_PATH=/var/log/novena-gateway
+Environment=PYTHONPATH=/opt/novena-gateway/current/vendor
 
 # Watchdog
 WatchdogSec=120
