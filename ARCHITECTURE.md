@@ -587,7 +587,7 @@ Instead of a simple `Type=simple` service, the gateway uses `Type=notify` with `
 ### Prerequisites
 
 - Raspberry Pi Compute Module 4 (2GB+ RAM, 32GB+ SD card)
-- Python 3.9+
+- Python 3.10+
 - Network access to the Mosquitto broker (port 8883 outbound)
 - CA certificate from Novena Hub
 

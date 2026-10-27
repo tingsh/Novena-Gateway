@@ -117,9 +117,28 @@ class RemoteConfigHandler:
         """No persistent resources to clean up."""
         pass
 
+    def reset_for_new_claim(self, config: dict):
+        """Prevent a new owner from inheriting rollback or replay state."""
+        self._envelope_guard.journal.reset()
+        self._write_last_known_good(config)
+        if os.path.isdir(self._backup_dir):
+            for name in os.listdir(self._backup_dir):
+                if name.startswith("config_backup_") and name.endswith(".json"):
+                    os.remove(os.path.join(self._backup_dir, name))
+        self._last_update_status = {
+            "config_update_status": "unknown",
+            "config_update_error": None,
+            "rollback_performed": False,
+            "connector_results": [],
+            "config_version_ts": None,
+        }
+
     def _on_config_update(self, topic: str, payload: dict):
         """Handle an inbound config update message."""
         request_id = payload.get("request_id", "unknown") if isinstance(payload, dict) else "unknown"
+        if self._gateway._config.get("mqtt", {}).get("mode") == "release_pending":
+            log.warning("Ignored config update while Gateway release is pending.")
+            return
         signed_body = None
         if not isinstance(payload, dict) or payload.get("schema_version") is None:
             log.warning("Rejected unsigned config update (request_id=%s)", request_id)

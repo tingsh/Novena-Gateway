@@ -52,7 +52,7 @@ from novena_gateway.connectors.modbus.entities.bytes_downlink_converter_config i
     BytesDownlinkConverterConfig  # noqa: E402
 from novena_gateway.connectors.modbus.backward_compatibility_adapter import BackwardCompatibilityAdapter  # noqa
 
-from pymodbus.exceptions import ConnectionException  # noqa: E402
+from pymodbus.exceptions import ConnectionException, ModbusIOException  # noqa: E402
 from pymodbus.pdu import ModbusPDU  # noqa
 from pymodbus.pdu.bit_message import WriteMultipleCoilsResponse, WriteSingleCoilResponse  # noqa: E402
 from pymodbus.constants import Endian  # noqa: E402
@@ -91,6 +91,7 @@ class AsyncModbusConnector(Connector, Thread):
             self.loop = asyncio.get_event_loop()
 
         self.process_device_requests = AsyncQueue(100000)
+        self._active_polls = set()
         self.__data_to_convert = Queue(-1)
         self.__data_to_save = Queue(-1)
 
@@ -221,15 +222,34 @@ class AsyncModbusConnector(Connector, Thread):
             try:
                 slave = self.process_device_requests.get_nowait()
 
-                if slave.type == 'serial':
-                    await self.__poll_device(slave)
-                else:
-                    self.loop.create_task(self.__poll_device(slave))
+                # Slaves on one host:port share a master client. A slow request
+                # must finish before that client starts another poll, even when
+                # the queued callback belongs to a different Modbus unit.
+                master = slave.master
+                if master in self._active_polls:
+                    self.__log.debug('Skipping overlapping poll for %s', slave)
+                    continue
+                self._active_polls.add(master)
+
+                try:
+                    if slave.type == 'serial':
+                        await self.__poll_device_exclusive(slave, master)
+                    else:
+                        self.loop.create_task(self.__poll_device_exclusive(slave, master))
+                except Exception:
+                    self._active_polls.discard(master)
+                    raise
             except QueueEmpty:
                 await asyncio.sleep(0.1)
                 continue
             except Exception as e:
                 self.__log.exception('Failed to poll device: %s', e)
+
+    async def __poll_device_exclusive(self, slave: Slave, master: Master):
+        try:
+            await self.__poll_device(slave)
+        finally:
+            self._active_polls.discard(master)
 
     async def __poll_device(self, slave: Slave):
         self.__log.debug("Polling %s slave", slave)
@@ -264,6 +284,15 @@ class AsyncModbusConnector(Connector, Thread):
                 self.__log.error('Timeout error for device %s', slave)
                 self.__record_device_failure(slave, "timeout", poll_started)
                 await slave.disconnect()
+            except ModbusIOException as e:
+                self.__delete_device_from_platform(slave)
+                self.__record_device_failure(slave, e, poll_started)
+                # A TCP socket can remain "connected" after the cable is lost.
+                # Pymodbus otherwise waits for several failed requests before
+                # closing it, delaying recovery even after the field link returns.
+                if slave.type == 'tcp':
+                    await slave.disconnect()
+                self.__log.error('Failed to poll %s device: %s', slave, e)
             except Exception as e:
                 self.__delete_device_from_platform(slave)
                 self.__record_device_failure(slave, e, poll_started)

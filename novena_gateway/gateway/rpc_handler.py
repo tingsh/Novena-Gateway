@@ -80,6 +80,14 @@ SIGNED_DEPLOYMENT_DIAGNOSTICS = {
     "deployment_validate",
 }
 
+MODBUS_READ_TYPE_ALIASES = {
+    "float32": "32float", "float64": "64float",
+    "int16": "16int", "uint16": "16uint",
+    "int32": "32int", "uint32": "32uint",
+    "int64": "64int", "uint64": "64uint",
+    "bool": "bits",
+}
+
 
 class RpcHandler:
     """Handles inbound RPC commands from Novena Hub."""
@@ -162,6 +170,9 @@ class RpcHandler:
         pass
 
     def _on_control_policy(self, topic, payload):
+        if self._gateway._config.get("mqtt", {}).get("mode") == "release_pending":
+            log.warning("Ignored control policy while Gateway release is pending.")
+            return
         try:
             self._governance.install_policy(topic, payload)
             log.info(
@@ -186,6 +197,9 @@ class RpcHandler:
 
     def _on_rpc_request(self, topic: str, payload: dict):
         """Handle an inbound RPC request."""
+        if self._gateway._config.get("mqtt", {}).get("mode") == "release_pending":
+            log.warning("Ignored RPC while Gateway release is pending.")
+            return
         if not isinstance(payload, dict):
             log.warning("Rejected malformed RPC payload: expected an object")
             return
@@ -956,6 +970,18 @@ class RpcHandler:
             rpc_params["type"] = params["type"]
 
         content = self._build_connector_rpc_content(device_name, "get", rpc_params)
+        if str(connector.get_type()).lower() == "modbus":
+            # The inherited Modbus reserved-get parser accepts its documented
+            # semicolon-delimited schema, not a dictionary of parameters.
+            requested_type = str(rpc_params.get("type") or ("bits" if function_code in (1, 2) else "16uint"))
+            data_type = MODBUS_READ_TYPE_ALIASES.get(requested_type.lower(), requested_type)
+            minimum_count = 4 if data_type.startswith("64") else 2 if data_type.startswith("32") else 1
+            if objects_count < minimum_count:
+                raise ValueError(f"Modbus type {requested_type} requires at least {minimum_count} objects")
+            content["data"]["params"] = (
+                f"type={data_type};functionCode={function_code};"
+                f"objectsCount={objects_count};address={address};"
+            )
 
         log.info("Reading from device '%s': FC=%d, addr=%d, count=%d",
                  device_name, function_code, address, rpc_params["objectsCount"])

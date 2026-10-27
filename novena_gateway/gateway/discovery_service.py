@@ -897,13 +897,15 @@ class DiscoveryService:
         """
         # Method 1: FC43 MEI device identification
         try:
-            from pymodbus.mei_message import ReadDeviceInformationRequest
-            request = ReadDeviceInformationRequest(read_code=0x01, slave=slave_id)
-            response = client.execute(request)
+            # pymodbus 3.x exposes this on the client. The old mei_message
+            # import disappeared before the versions used by our Gateway.
+            response = client.read_device_information(read_code=0x01, slave=slave_id)
             if response and not response.isError() and hasattr(response, "information"):
                 info = response.information
-                vendor = info.get(0x00, b"").decode(errors="ignore").strip()
-                model = info.get(0x01, b"").decode(errors="ignore").strip()
+                vendor = info.get(0x00, b"")
+                model = info.get(0x01, b"")
+                vendor = vendor.decode(errors="ignore").strip() if isinstance(vendor, bytes) else str(vendor).strip()
+                model = model.decode(errors="ignore").strip() if isinstance(model, bytes) else str(model).strip()
                 if vendor or model:
                     return {
                         "vendor": vendor or "Unknown",
@@ -1263,7 +1265,7 @@ class DiscoveryService:
         """Generate a human-readable label for a serial port."""
         if "ttyUSB" in port:
             idx = port.replace("/dev/ttyUSB", "")
-            return f"RS485-{int(idx) + 1}" if idx.isdigit() else f"USB-Serial"
+            return f"RS485-{int(idx) + 1}" if idx.isdigit() else "USB-Serial"
         elif "ttyAMA" in port:
             return "Built-in UART"
         elif "ttyACM" in port:

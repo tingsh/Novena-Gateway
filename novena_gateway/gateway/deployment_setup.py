@@ -93,6 +93,12 @@ class ConfigReplayJournal:
                 self._state["requests"] = dict(ordered[:500])
             self._persist()
 
+    def reset(self):
+        """Start revision numbering over after ownership changes."""
+        with self._lock:
+            self._state = {"max_revision": 0, "requests": {}}
+            self._persist()
+
 
 class ConfigEnvelopeGuard:
     """Verify signed config envelopes independently at the Gateway."""

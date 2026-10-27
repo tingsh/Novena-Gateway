@@ -19,6 +19,11 @@ echo "======================================"
 echo "  Novena Gateway - Installer"
 echo "======================================"
 
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+    echo "ERROR: Novena Gateway requires Python 3.10 or newer."
+    exit 1
+fi
+
 echo "[1/6] Creating installation directories..."
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$RELEASE_DIR"

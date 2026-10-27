@@ -233,6 +233,22 @@ class SafeDiscoveryTargetTest(unittest.TestCase):
         self.assertEqual(service._tcp_probe_attempts, 3)
         self.assertEqual(service._tcp_probe_retry_delay_ms, 200)
 
+    def test_device_identification_uses_supported_pymodbus_client_api(self):
+        response = MagicMock()
+        response.isError.return_value = False
+        response.information = {0x00: b"Novena", 0x01: b"NCH-200"}
+        client = MagicMock()
+        client.read_device_information.return_value = response
+        service = DiscoveryService(
+            gateway=MagicMock(), publisher=MagicMock(), serial_number="NF-GUIDED"
+        )
+
+        identity = service._identify_device_tcp(client, 1)
+
+        self.assertEqual(identity["vendor"], "Novena")
+        self.assertEqual(identity["model"], "NCH-200")
+        client.read_device_information.assert_called_once_with(read_code=0x01, slave=1)
+
     def test_tcp_probe_uses_single_protocol_connection_without_raw_socket_precheck(self):
         response = MagicMock()
         response.isError.return_value = False

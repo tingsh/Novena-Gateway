@@ -78,21 +78,21 @@ STAGING_DIR=""
 # Write version file
 echo "__version__ = \"${VERSION}\"" > "${NEW_RELEASE_DIR}/novena_gateway/__version__.py"
 
-# 3. Pre-install dependencies in the new directory
+# 3. Keep candidate dependencies with the release so rollback restores both
+# the code and its Python packages. The base venv belongs to the installed
+# release and must not be changed while the old service is still running.
 echo "Installing dependencies..."
 if [ -f "${NEW_RELEASE_DIR}/requirements.txt" ]; then
-    if [ -d "${INSTALL_DIR}/venv" ]; then
-        "${INSTALL_DIR}/venv/bin/pip" install -r "${NEW_RELEASE_DIR}/requirements.txt"
-    else
+    if [ ! -d "${INSTALL_DIR}/venv" ]; then
         python3 -m venv "${INSTALL_DIR}/venv"
-        "${INSTALL_DIR}/venv/bin/pip" install -r "${NEW_RELEASE_DIR}/requirements.txt"
     fi
+    "${INSTALL_DIR}/venv/bin/pip" install --target "${NEW_RELEASE_DIR}/vendor" -r "${NEW_RELEASE_DIR}/requirements.txt"
 fi
 
 # 3.5 Validate candidate code against current production config before swap
 echo "Validating candidate release..."
 if [ -f "${CONFIG_PATH}" ]; then
-    if ! (cd "${NEW_RELEASE_DIR}" && "${INSTALL_DIR}/venv/bin/python" -m novena_gateway.main --config "${CONFIG_PATH}" --validate-only); then
+    if ! (cd "${NEW_RELEASE_DIR}" && PYTHONPATH="${NEW_RELEASE_DIR}/vendor" "${INSTALL_DIR}/venv/bin/python" -m novena_gateway.main --config "${CONFIG_PATH}" --validate-only); then
         echo "ERROR: Candidate release failed config validation"
         write_status "failed" "Candidate release failed config validation" "false"
         exit 1

@@ -172,7 +172,12 @@ class AttributeSyncHandler:
             "remote_control_local_writeback_enabled": local_writeback_enabled,
             "remote_control_policy_loaded": False,
             "gateway_capabilities": list(
-                getattr(getattr(self._gateway, "_remote_config", None), "capabilities", [])
+                dict.fromkeys([
+                    *getattr(getattr(self._gateway, "_remote_config", None), "capabilities", []),
+                    *(["secure_release_v1"] if getattr(
+                        getattr(self._gateway, "_mqtt_publisher", None), "_trusted_release_keys", {}
+                    ) else []),
+                ])
             ),
         }
         rpc_handler = getattr(self._gateway, "_rpc_handler", None)
