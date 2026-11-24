@@ -9,6 +9,8 @@ import stat
 import subprocess
 import tempfile
 
+from novena_gateway.gateway.ota_security import DEFAULT_OTA_PUBLIC_KEY_PATH
+
 
 CONFIG_PATH = Path("/etc/novena-gateway/config.json")
 DATA_DIR = Path("/var/lib/novena-gateway")
@@ -29,12 +31,26 @@ def reset_local_state(config_path: Path, data_dir: Path, log_dir: Path, serial: 
 
     # Keep only the vendor's public OTA trust key. Other files under /etc can
     # include prior site credentials, client certificates, or config snapshots.
-    ota_key = Path(current.get("ota", {}).get("public_key_path") or "")
-    saved_ota_key = None
-    if ota_key.is_absolute() and ota_key.is_relative_to(config_path.parent):
-        if ota_key.is_symlink() or not ota_key.is_file() or ota_key.stat().st_size > 16384:
+    key_paths = (
+        (DEFAULT_OTA_PUBLIC_KEY_PATH, False),
+        (current.get("ota", {}).get("public_key_path"), True),
+        (current.get("features", {}).get("rpc", {}).get("ota_public_key_path"), True),
+    )
+    saved_ota_keys = {}
+    config_root = config_path.parent.resolve()
+    for configured_path, required in key_paths:
+        if not configured_path:
+            continue
+        ota_key = Path(configured_path)
+        if not ota_key.is_absolute() or not ota_key.is_relative_to(config_root):
+            continue
+        if not ota_key.exists() and not ota_key.is_symlink() and not required:
+            continue
+        if ota_key.is_symlink() or ota_key.resolve() != ota_key or not ota_key.is_file():
             raise ValueError("Factory OTA trust key is missing or unsafe")
-        saved_ota_key = ota_key.read_bytes()
+        if ota_key.stat().st_size > 16384:
+            raise ValueError("Factory OTA trust key is too large")
+        saved_ota_keys[ota_key] = ota_key.read_bytes()
 
     # An intentionally unstartable configuration prevents the old site from
     # reconnecting if the machine reboots before cloud revocation/reprovisioning.
@@ -69,7 +85,7 @@ def reset_local_state(config_path: Path, data_dir: Path, log_dir: Path, serial: 
             shutil.rmtree(path)
         else:
             path.unlink()
-    if saved_ota_key is not None:
+    for ota_key, saved_ota_key in saved_ota_keys.items():
         ota_key.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
         ota_key.write_bytes(saved_ota_key)
         ota_key.chmod(0o644)

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from novena_gateway.engineer_reset import reset_local_state
 from novena_gateway.gateway.novena_gateway import NovenaGateway
@@ -63,3 +64,17 @@ class EngineerResetTests(unittest.TestCase):
             (root / "data").symlink_to(real_data, target_is_directory=True)
             with self.assertRaises(ValueError):
                 reset_local_state(config, root / "data", root / "logs", "NF-RESET")
+
+    def test_preserves_default_ota_trust_key(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config_dir = root / "etc"
+            trust_dir = config_dir / "trust"
+            trust_dir.mkdir(parents=True)
+            key = trust_dir / "ota_vendor_ed25519.pub"
+            key.write_text("manufacturer public key")
+            config = config_dir / "config.json"
+            config.write_text('{"gateway": {"serial_number": "NF-RESET"}}')
+            with patch("novena_gateway.engineer_reset.DEFAULT_OTA_PUBLIC_KEY_PATH", str(key)):
+                reset_local_state(config, root / "data", root / "logs", "NF-RESET")
+            self.assertEqual(key.read_text(), "manufacturer public key")
