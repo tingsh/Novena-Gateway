@@ -419,7 +419,7 @@ class NovenaMqttPublisher:
                 "    Set APP_BASE_URL to your Novena Hub URL.\n"
                 "\n"
                 f"  Serial Number: {self._serial_number}\n"
-                "  (Claim Code is on the sticker on your gateway)\n"
+                "  (Use the current claim code; Novena reissues it after a release)\n"
                 "=========================================================="
             )
             log.warning(msg)

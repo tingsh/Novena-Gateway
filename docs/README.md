@@ -15,3 +15,5 @@ accepts `--serial`, `--runtime-dir` and `--mqtt-password-file` for isolated iden
 Use `install/hardware-test/probe_mqtt_auth.py --config <private-saved-config> --expect rejected`
 after release; it requires an explicit authentication rejection, not a network failure.
 The coordinated Ubuntu broker procedure is in the Hub's `docs/local_mqtt_dynamic_security.md`.
+
+Engineer physical recovery is implemented by `python -m novena_gateway.engineer_reset` in a stopped Gateway release. It requires root, the exact serial, a support case reference, and `--confirm ERASE-LOCAL-CUSTOMER-DATA`. The command erases local customer state and leaves the service unstartable until Hub has verified broker revocation and the physical Gateway receives a fresh claim credential. Follow the Hub's `docs/gateway_support_recovery.md` runbook; never treat a local wipe alone as a cloud ownership release.

@@ -175,6 +175,9 @@ class NovenaGateway:
         """Validate config dictionary structure. Returns a list of error strings (empty if valid)."""
         errors = []
 
+        if config.get("mqtt", {}).get("mode") == "support_reset_pending":
+            return ["Gateway was locally reset; Hub revocation and fresh provisioning are required"]
+
         # Required top-level keys
         deployment_mode = NovenaGateway.deployment_mode(config)
         if "gateway" not in config or "serial_number" not in config.get("gateway", {}):
